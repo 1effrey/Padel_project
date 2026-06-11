@@ -56,6 +56,8 @@ def run(
         iou_threshold=det_cfg["iou_threshold"],
         imgsz=det_cfg.get("imgsz", 640),
         person_class=det_cfg.get("classes", [0])[0],
+        enhance=det_cfg.get("enhance", False),
+        tiling=det_cfg.get("tiling"),
     )
     tracker = PlayerTracker(**trk_cfg)
     polygon = roi_utils.to_polygon(court_cfg.get("polygon"))

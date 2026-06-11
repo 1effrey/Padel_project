@@ -1,0 +1,37 @@
+{
+  "source": "side-2-full-vid.mp4",
+  "model": "yolo11s-pose.pt",
+  "device": "cpu",
+  "detection": {
+    "conf_threshold": 0.3,
+    "iou_threshold": 0.5,
+    "classes": [
+      0
+    ],
+    "imgsz": 1280
+  },
+  "tracker": {
+    "track_activation_threshold": 0.25,
+    "lost_track_buffer": 30,
+    "minimum_matching_threshold": 0.8,
+    "frame_rate": 30,
+    "minimum_consecutive_frames": 1
+  },
+  "court": {
+    "polygon": [
+      [471, 321],
+      [1448, 333],
+      [1666, 580],
+      [1890, 1056],
+      [52, 1054],
+      [258, 598]
+    ],
+    "net_x": null
+  },
+  "skeleton": {
+    "keypoint_conf_threshold": 0.5
+  },
+  "output": {
+    "dir": "output"
+  }
+}

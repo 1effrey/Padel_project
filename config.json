@@ -1,7 +1,7 @@
 {
   "source": "side-1-full-vid.mp4",
   "model": "yolo11n-pose.pt",
-  "device": "cuda",
+  "device": "cpu",
   "detection": {
     "conf_threshold": 0.3,
     "iou_threshold": 0.5,

@@ -1,3 +1,20 @@
-.venv
-side-1-full-vid.mp4
-side-2-full-vid.mp4
+# Virtual environment
+.venv/
+
+# Large input videos (keep these local)
+*.mp4
+*.avi
+*.mov
+
+# Model weights (auto-downloaded by ultralytics on first run)
+*.pt
+
+# Bundled library folder (reinstalled via requirements.txt)
+pytorch_lightning/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated outputs
+output/
