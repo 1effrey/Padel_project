@@ -1,0 +1,37 @@
+{
+  "source": "side-1-full-vid.mp4",
+  "model": "yolo11n-pose.pt",
+  "device": "cuda",
+  "detection": {
+    "conf_threshold": 0.3,
+    "iou_threshold": 0.5,
+    "classes": [
+      0
+    ],
+    "imgsz": 640
+  },
+  "tracker": {
+    "track_activation_threshold": 0.25,
+    "lost_track_buffer": 30,
+    "minimum_matching_threshold": 0.8,
+    "frame_rate": 30,
+    "minimum_consecutive_frames": 1
+  },
+  "court": {
+    "polygon": [
+      [200, 2050],
+      [470, 1150],
+      [980, 640],
+      [2780, 640],
+      [3300, 1150],
+      [3650, 2000]
+    ],
+    "net_x": null
+  },
+  "skeleton": {
+    "keypoint_conf_threshold": 0.5
+  },
+  "output": {
+    "dir": "output"
+  }
+}
