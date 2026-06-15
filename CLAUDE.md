@@ -16,8 +16,13 @@ All are junior and learning CV while building this. **Quality is the priority, n
 - **Explain the code.** The team is learning. Add clear comments and, when you write a
   new file, briefly explain in chat what each part does and why.
 - **Ask, don't assume.** If a step is ambiguous, ask before writing code.
-- **No premature optimization.** Get it correct and readable first. Speed (TensorRT,
-  threading) is Phase 6, not now.
+- **Correct first, then optimize at each phase boundary.** WITHIN a phase, get it
+  correct and readable first — do not optimize mid-build. But optimization is NO LONGER
+  deferred to Phase 6 alone: at the END of every phase, STOP, announce the phase is
+  complete, and ASK whether to do an optimization pass before moving on. The user decides
+  each time (yes -> optimize now; no -> move to the next phase). Speed work (TensorRT,
+  threading, batching, FP16, GPU decode) is on the table at any phase boundary, not just
+  Phase 6.
 
 ## Critical architecture decisions (do not violate)
 

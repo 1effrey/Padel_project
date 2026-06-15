@@ -1,7 +1,7 @@
 {
   "source": "side-1-full-vid.mp4",
   "model": "yolo11s-pose.pt",
-  "device": "cpu",
+  "device": "cuda",
   "detection": {
     "conf_threshold": 0.3,
     "iou_threshold": 0.5,
@@ -19,19 +19,156 @@
   },
   "court": {
     "polygon": [
-      [987, 624],
-      [2844, 660],
-      [3492, 1113],
-      [3795, 2145],
-      [42, 2148],
-      [387, 1125]
+      [
+        987,
+        624
+      ],
+      [
+        2844,
+        660
+      ],
+      [
+        3492,
+        1113
+      ],
+      [
+        3795,
+        2145
+      ],
+      [
+        42,
+        2148
+      ],
+      [
+        387,
+        1125
+      ]
     ],
     "net_x": null
   },
   "skeleton": {
     "keypoint_conf_threshold": 0.5
   },
+  "display": {
+    "playback_fps": 20
+  },
   "output": {
     "dir": "output"
+  },
+  "reid": {
+    "enabled": true,
+    "w_pos": 0.6,
+    "w_color": 0.4,
+    "match_threshold": 0.5,
+    "position_ttl_frames": 90,
+    "color_ema": 0.0,
+    "players_dir": "players"
+  },
+  "fusion": {
+    "dedup_m": 1.5,
+    "bounds_margin_m": 2.0
+  },
+  "homography": {
+    "image_points": [
+      [
+        990.0,
+        1083.0
+      ],
+      [
+        2829.0,
+        1089.0
+      ],
+      [
+        840.0,
+        1239.0
+      ],
+      [
+        2961.0,
+        1239.0
+      ],
+      [
+        303.0,
+        1833.0
+      ],
+      [
+        3516.0,
+        1824.0
+      ]
+    ],
+    "world_points": [
+      [
+        0.0,
+        20.0
+      ],
+      [
+        10.0,
+        20.0
+      ],
+      [
+        0.0,
+        16.95
+      ],
+      [
+        10.0,
+        16.95
+      ],
+      [
+        0.0,
+        10.0
+      ],
+      [
+        10.0,
+        10.0
+      ]
+    ],
+    "H": [
+      [
+        0.0007787371176676542,
+        0.0007040098184975262,
+        -1.526407343959265
+      ],
+      [
+        -1.336979008622831e-05,
+        -0.000506782119416513,
+        3.4671250384585974
+      ],
+      [
+        -7.887781406748246e-07,
+        0.00014502949791578577,
+        -0.012185833185810877
+      ]
+    ],
+    "H_inv": [
+      [
+        1289.2299777688702,
+        552.373791218352,
+        -4328.067124602099
+      ],
+      [
+        7.521889341525132,
+        27.758343985840682,
+        6955.632908777735
+      ],
+      [
+        0.006070935707445654,
+        0.29461082098396846,
+        1.0
+      ]
+    ],
+    "reprojection_error_m": {
+      "mean": 0.0403,
+      "max": 0.1671
+    },
+    "court_dimensions_m": {
+      "width": 10.0,
+      "length": 20.0
+    }
+  },
+  "sync": {
+    "other_source": "side-2-full-vid.mp4",
+    "offset_frames": 54,
+    "method": "clock-tick",
+    "note": "side-B frame = side-A frame + 54 (2.70s @20.01fps). Frame-exact: side-A clock ticks :50->:51 at frame 1009, side-B at frame 1063 (1063-1009=54); confirmed no drift at f~20000. Geometry net-coincidence sweep corroborates (flat ~0.7-0.85m for offsets 46-58, rising past 60). Motion-energy xcorr was ambiguous and is not used.",
+    "uncertainty_frames": 1
   }
 }
