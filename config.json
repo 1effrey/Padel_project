@@ -34,6 +34,9 @@
   "display": {
     "playback_fps": 20
   },
+  "decode": {
+    "hw_accel": true
+  },
   "output": {
     "dir": "output"
   }

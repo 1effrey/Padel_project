@@ -23,6 +23,7 @@ from utils import roi as roi_utils
 from utils.colors import color_for_id
 from utils.court_position import player_court_position
 from utils.display import PlaybackThrottle
+from utils.video_io import open_capture
 from utils.homography import Homography, draw_court_lines
 from utils.metrics import Metrics, NumpyEncoder
 from utils.minimap import Minimap
@@ -111,8 +112,9 @@ def run(
                   f"(w_pos={identity.w_pos}, w_color={identity.w_color}, "
                   f"match_threshold={identity.match_threshold}).")
 
-    # --- open the video source ---------------------------------------------
-    cap = cv2.VideoCapture(config["source"])
+    # --- open the video source (GPU hardware decode when available) ---------
+    cap, _hw_decode = open_capture(
+        config["source"], config.get("decode", {}).get("hw_accel", True))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open source: {config['source']}")
     fps_in = cap.get(cv2.CAP_PROP_FPS) or trk_cfg.get("frame_rate", 30)

@@ -48,6 +48,7 @@ from utils import roi as roi_utils
 from utils.colors import color_for_id
 from utils.court_position import foot_pixel
 from utils.display import PlaybackThrottle
+from utils.video_io import open_capture
 from utils.homography import COURT_LENGTH_M, COURT_WIDTH_M, Homography
 from utils.metrics import NumpyEncoder
 from utils.minimap import Minimap
@@ -217,8 +218,10 @@ class FusionPipeline:
     # -- main loop -----------------------------------------------------------
     def run(self, show: bool = False, save_video: bool = True,
             max_frames: Optional[int] = None, start_frame: int = 0) -> Dict[str, Any]:
-        cap_a = cv2.VideoCapture(self.cfg_a["source"])
-        cap_b = cv2.VideoCapture(self.cfg_b["source"])
+        cap_a, _hw_a = open_capture(
+            self.cfg_a["source"], self.cfg_a.get("decode", {}).get("hw_accel", True))
+        cap_b, _hw_b = open_capture(
+            self.cfg_b["source"], self.cfg_b.get("decode", {}).get("hw_accel", True))
         if not cap_a.isOpened() or not cap_b.isOpened():
             raise RuntimeError("Could not open one of the two sources.")
         # seek each so that A[start] aligns with B[start+offset]
