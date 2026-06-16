@@ -330,6 +330,8 @@ def main() -> None:
                         help="estimate the time offset between --config and --config2 clips and exit")
     parser.add_argument("--fuse", action="store_true",
                         help="run cross-camera fusion (needs --config2, sync + both homographies)")
+    parser.add_argument("--ball-fuse", action="store_true",
+                        help="dual-camera 3D BALL triangulation (needs --config2, sync + both homographies)")
     parser.add_argument("--start-frame", type=int, default=0,
                         help="side-A frame to start fusion from (for quick spot-checks)")
     parser.add_argument("--source", help="override config source (video path / index)")
@@ -337,6 +339,17 @@ def main() -> None:
     parser.add_argument("--show", action="store_true", help="display the annotated window")
     parser.add_argument("--save-video", action="store_true", help="write output/phase1_annotated.mp4")
     parser.add_argument("--max-frames", type=int, default=None, help="stop after N frames (for quick measuring)")
+    parser.add_argument("--profile", action="store_true", help="print a per-stage timing breakdown at the end")
+    parser.add_argument("--ball-eval", action="store_true",
+                        help="run the Phase-1 ball-detector quality gate on --source and exit")
+    parser.add_argument("--label-ball", action="store_true",
+                        help="open the click-to-label ball tool on --source and exit")
+    parser.add_argument("--label-from",
+                        help="with --label-ball: label only the frames listed in this CSV")
+    parser.add_argument("--mine-hard", action="store_true",
+                        help="find frames worth labeling (model misses / low conf) and exit")
+    parser.add_argument("--precision", action="store_true",
+                        help="score the detector against the labeled frames (real precision) and exit")
     parser.add_argument("--calibrate-roi", action="store_true", help="define the court polygon and exit")
     parser.add_argument("--calibrate-homography", action="store_true", help="define the pixel<->meters homography and exit")
     parser.add_argument("--verify-homography", action="store_true", help="redraw the saved homography overlay and exit")
@@ -347,6 +360,30 @@ def main() -> None:
         config["source"] = args.source
     if args.model:
         config["model"] = args.model
+
+    if args.ball_eval:
+        # Standalone Phase-1 ball gate. Imported here (not at top) so a normal
+        # player run never imports torch-heavy ball code it doesn't use.
+        from core.ball_eval import run_ball_eval
+        run_ball_eval(config, show=args.show, save_video=args.save_video,
+                      max_frames=args.max_frames, profile=args.profile)
+        return
+
+    if args.mine_hard:
+        from core.ball_mine import run_mine_hard
+        run_mine_hard(config, max_frames=args.max_frames)
+        return
+
+    if args.precision:
+        from core.ball_precision import run_precision
+        run_precision(config)
+        return
+
+    if args.label_ball:
+        from core.ball_label import run_label_ball, read_frame_list
+        frames = read_frame_list(args.label_from) if args.label_from else None
+        run_label_ball(config, frames=frames)
+        return
 
     if args.calibrate_roi:
         calibrate_roi(config, args.config)
@@ -376,10 +413,21 @@ def main() -> None:
         config_b = load_config(args.config2)
         FusionPipeline(config, config_b).run(
             show=args.show, save_video=args.save_video,
-            max_frames=args.max_frames, start_frame=args.start_frame)
+            max_frames=args.max_frames, start_frame=args.start_frame,
+            profile=args.profile)
         return
 
-    run(config, show=args.show, save_video=args.save_video, max_frames=args.max_frames)
+    if args.ball_fuse:
+        if not args.config2:
+            parser.error("--ball-fuse requires --config2 (the second camera's config)")
+        from core.ball_fusion import run_ball_fusion
+        config_b = load_config(args.config2)
+        run_ball_fusion(config, config_b, show=args.show, save_video=args.save_video,
+                        max_frames=args.max_frames, start_frame=args.start_frame)
+        return
+
+    run(config, show=args.show, save_video=args.save_video,
+        max_frames=args.max_frames, profile=args.profile)
 
 
 if __name__ == "__main__":

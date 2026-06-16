@@ -19,12 +19,30 @@
   },
   "court": {
     "polygon": [
-      [200, 2050],
-      [470, 1150],
-      [980, 640],
-      [2780, 640],
-      [3300, 1150],
-      [3650, 2000]
+      [
+        200,
+        2050
+      ],
+      [
+        470,
+        1150
+      ],
+      [
+        980,
+        640
+      ],
+      [
+        2780,
+        640
+      ],
+      [
+        3300,
+        1150
+      ],
+      [
+        3650,
+        2000
+      ]
     ],
     "net_x": null
   },
@@ -39,5 +57,52 @@
   },
   "output": {
     "dir": "output"
+  },
+  "ball": {
+    "enabled": false,
+    "weights": "weights/ball_tracknet_v2.pt",
+    "input_width": 512,
+    "input_height": 288,
+    "in_frames": 3,
+    "heatmap_threshold": 0.7,
+    "min_blob_area": 2,
+    "method": "tracknet",
+    "label_stride": 2,
+    "motion": {
+      "history": 200,
+      "var_threshold": 25,
+      "min_area": 8,
+      "max_area": 1500,
+      "min_circularity": 0.35,
+      "morph_kernel": 3,
+      "warmup_frames": 15,
+      "use_court_roi": true
+    },
+    "tracker": {
+      "enabled": true,
+      "process_noise": 50000.0,
+      "meas_noise": 25.0,
+      "conf_ref": 0.7,
+      "conf_floor": 0.05,
+      "max_coast_frames": 15,
+      "gate": 0.0,
+      "min_updates_before_gating": 3,
+      "assoc_radius_px": 600,
+      "trail_len": 30
+    },
+    "roi": {
+      "enabled": true,
+      "margin_px": 200
+    },
+    "events": {
+      "enabled": true,
+      "min_vy_px_s": 500,
+      "min_vx_px_s": 500,
+      "wall_margin_m": 0.6,
+      "hit_angle_deg": 70,
+      "hit_min_speed_px_s": 1500,
+      "refractory_frames": 3,
+      "in_out_margin_m": 0.1
+    }
   }
 }

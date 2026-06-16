@@ -21,3 +21,6 @@ __pycache__/
 
 # Generated outputs
 output/
+
+# Weight backups & checkpoints
+*.bak

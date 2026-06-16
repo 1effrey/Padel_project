@@ -18,7 +18,9 @@ WHAT STAYS THE SAME (important)
 """
 from __future__ import annotations
 
-from typing import Any, Tuple
+import queue
+import threading
+from typing import Any, Optional, Tuple
 
 import cv2
 
@@ -61,3 +63,82 @@ def open_capture(source: Any, hw_accel: bool = True) -> Tuple[cv2.VideoCapture, 
     cap = cv2.VideoCapture(source)
     print(f"[decode] hardware acceleration not active -> CPU decode -> {source}")
     return cap, False
+
+
+class ThreadedVideoReader:
+    """Decode frames on a BACKGROUND thread so decoding overlaps inference.
+
+    WHY (proven by the profiler, not guessed)
+      `cap.read()` is synchronous and costs real wall-clock time even with NVDEC
+      (it also copies the 4K frame off the GPU and converts colour) -- ~33 ms/frame
+      single, ~52 ms dual. Run sequentially, the GPU sits idle during that read.
+      A reader thread fills a small queue while the main loop runs inference on the
+      previous frame, so the two overlap. Same frames, same order -> byte-identical
+      output; this is pure scheduling.
+
+    SYNC SAFETY
+      The queue is bounded and NEVER drops frames (a full queue makes the reader
+      wait). Order is FIFO, so the fusion pipeline's frame-exact A<->B alignment is
+      preserved -- dropping frames would desync the fixed offset. (For a future
+      LIVE-stream "always latest" mode, add a drop-oldest flag; not needed offline.)
+    """
+
+    def __init__(self, source: Any, hw_accel: bool = True,
+                 queue_size: int = 4, start_frame: int = 0) -> None:
+        self.cap, self.hw_active = open_capture(source, hw_accel)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Could not open source: {source}")
+        if start_frame > 0:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        # Cache properties NOW (before the thread starts touching the capture), so
+        # the main thread never races the reader thread on the same cv2 object.
+        self.fps: float = self.cap.get(cv2.CAP_PROP_FPS) or 0.0
+        self.width: int = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height: int = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        self._queue: "queue.Queue" = queue.Queue(maxsize=max(1, queue_size))
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+
+    def _put(self, item: Optional[Any]) -> bool:
+        """Block until there is room, but wake every 100 ms to honour stop()."""
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _reader_loop(self) -> None:
+        while not self._stop.is_set():
+            ok, frame = self.cap.read()
+            if not ok:
+                self._put(None)   # end-of-stream sentinel
+                break
+            if not self._put(frame):
+                break
+
+    def read(self) -> Tuple[bool, Optional[Any]]:
+        """Pull the next frame. Returns (ok, frame); (False, None) at end-of-stream
+        -- same contract as cv2.VideoCapture.read(), so call sites barely change."""
+        while not self._stop.is_set():
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            return (item is not None), item
+        return False, None
+
+    def stop(self) -> None:
+        """Signal the thread, drain so a blocked put() can exit, join, release."""
+        self._stop.set()
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._thread.join(timeout=2.0)
+        self.cap.release()

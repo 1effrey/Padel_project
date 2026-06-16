@@ -48,10 +48,13 @@ from utils import roi as roi_utils
 from utils.colors import color_for_id
 from utils.court_position import foot_pixel
 from utils.display import PlaybackThrottle
-from utils.video_io import open_capture
+from utils.profiler import StageTimer
+from utils.video_io import ThreadedVideoReader
 from utils.homography import COURT_LENGTH_M, COURT_WIDTH_M, Homography
 from utils.metrics import NumpyEncoder
 from utils.minimap import Minimap
+from utils.movement_log import MovementWriter
+from utils.player_keypoint_log import PlayerKeypointWriter
 
 NET_Y_M = COURT_LENGTH_M / 2.0     # 10.0 -- the half boundary
 
@@ -134,6 +137,8 @@ class FusionPipeline:
                 "cam": cam, "gpos": gpos, "conf": float(det["conf"]),
                 "bh": float(y2 - y1),                  # bbox height = closeness proxy
                 "bbox": det["bbox"], "frame": frame,   # frame ref for colour crop
+                "foot_px": foot_px,                    # chosen foot point (image px)
+                "keypoints": det["keypoints"],         # COCO-17, for the per-player CSV
             })
         return out
 
@@ -217,17 +222,21 @@ class FusionPipeline:
 
     # -- main loop -----------------------------------------------------------
     def run(self, show: bool = False, save_video: bool = True,
-            max_frames: Optional[int] = None, start_frame: int = 0) -> Dict[str, Any]:
-        cap_a, _hw_a = open_capture(
-            self.cfg_a["source"], self.cfg_a.get("decode", {}).get("hw_accel", True))
-        cap_b, _hw_b = open_capture(
-            self.cfg_b["source"], self.cfg_b.get("decode", {}).get("hw_accel", True))
-        if not cap_a.isOpened() or not cap_b.isOpened():
-            raise RuntimeError("Could not open one of the two sources.")
-        # seek each so that A[start] aligns with B[start+offset]
-        cap_a.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        cap_b.set(cv2.CAP_PROP_POS_FRAMES, start_frame + self.offset)
-        fps = cap_a.get(cv2.CAP_PROP_FPS) or 20.0
+            max_frames: Optional[int] = None, start_frame: int = 0,
+            profile: bool = False) -> Dict[str, Any]:
+        # Background readers, each on its own thread, so the two CPU-side decodes
+        # overlap the GPU inference instead of running before it. A starts at
+        # `start_frame`, B at `start_frame + offset`, and the bounded no-drop queues
+        # keep the feeds frame-exact aligned (dropping would desync the offset).
+        dec_a = self.cfg_a.get("decode", {})
+        dec_b = self.cfg_b.get("decode", {})
+        reader_a = ThreadedVideoReader(
+            self.cfg_a["source"], hw_accel=dec_a.get("hw_accel", True),
+            queue_size=dec_a.get("queue_size", 4), start_frame=start_frame)
+        reader_b = ThreadedVideoReader(
+            self.cfg_b["source"], hw_accel=dec_b.get("hw_accel", True),
+            queue_size=dec_b.get("queue_size", 4), start_frame=start_frame + self.offset)
+        fps = reader_a.fps or 20.0
 
         # we always save the small top-down map; the combined [A|B|map] view is
         # built when the user wants to watch (show) or save it (save_video)
@@ -237,6 +246,12 @@ class FusionPipeline:
         view_writer = None              # lazily opened once we know the view size
         want_view = show or save_video
         pos_writer = open(os.path.join(self.out_dir, "fusion_positions.jsonl"), "w")
+        # per-run player-movement CSV (global court metres, fused IDs)
+        movement = MovementWriter(self.out_dir, "fused", fps)
+        # per-player keypoint/bbox CSVs (P1..P4). Each cluster member (one per camera)
+        # is written to its player's file; source_video says which camera it came from.
+        kp_writer = PlayerKeypointWriter(self.out_dir, "fused")
+        src_by_cam = {"A": self.cfg_a["source"], "B": self.cfg_b["source"]}
         # playback-speed knob for the preview window (camera-A's config drives it):
         # 0/missing -> as fast as possible; >0 -> throttle to that fps. See utils/display.py
         throttle = PlaybackThrottle(self.cfg_a.get("display", {}).get("playback_fps", 0))
@@ -245,26 +260,33 @@ class FusionPipeline:
             cv2.resizeWindow("Fusion: side-1 | side-2 | top-down", 1600, 540)
 
         ids_seen = set()
+        timer = StageTimer(profile)   # per-stage timing (no-op unless --profile)
+        t0 = time.time()
         n = 0
         while True:
             loop_t0 = time.time()   # start of this frame's work (for playback throttle)
-            ok_a, frame_a = cap_a.read()
-            ok_b, frame_b = cap_b.read()
+            timer.start_frame()
+            ok_a, frame_a = reader_a.read()
+            ok_b, frame_b = reader_b.read()
             if not ok_a or not ok_b:
                 break
+            timer.lap("decode(2x)")
 
             # 1) both cameras -> global-frame candidates
             cands = (self._candidates(frame_a, self.det_a, self.poly_a, self.hom_a, "A")
                      + self._candidates(frame_b, self.det_b, self.poly_b, self.hom_b, "B"))
+            timer.lap("detect(2x)")
             # 2) sanity-drop off-court junk, then 3) cluster the overlap
             clusters = self._cluster(self._sanity(cands))
             reps = [self._rep(cl) for cl in clusters]
+            timer.lap("cluster")
 
             # 4) traits for the ONE identity manager (global pos + per-camera colour)
             dets_pos = [list(r["gpos"]) for r in reps]
             dets_hist = [_color_hist(_bbox_crop(r["frame"], r["bbox"])) for r in reps]
             metas = [{"camera": r["cam"], "track_id": None} for r in reps]
             results = self.identity.assign(dets_pos, dets_hist, n, metas)
+            timer.lap("reid")
 
             # 5) propagate each cluster's assigned id to ALL its members (so both
             #    cameras' boxes get the same P#), build the map + log
@@ -272,6 +294,11 @@ class FusionPipeline:
             for cl, r, (pid, cost) in zip(clusters, reps, results):
                 for c in cl:
                     c["pid"] = pid
+                    # one per-player keypoint row per camera that saw this player
+                    if pid is not None:
+                        kp_writer.add(pid, src_by_cam.get(c["cam"]), start_frame + n,
+                                      None, c["bbox"], c["conf"],
+                                      c["foot_px"], c["gpos"], c["keypoints"])
                 positions.append({"foot_m": list(r["gpos"]), "track_id": pid,
                                   "inside": True, "camera": r["cam"], "cost": cost})
                 if pid is not None:
@@ -284,6 +311,8 @@ class FusionPipeline:
             mm_writer.write(mm)
             pos_writer.write(json.dumps({"frame": start_frame + n, "players": positions},
                                         cls=NumpyEncoder) + "\n")
+            movement.add(start_frame + n, positions)
+            timer.lap("minimap+io")
 
             if want_view:
                 all_cands = [c for cl in clusters for c in cl]
@@ -301,28 +330,37 @@ class FusionPipeline:
                     work_ms = (time.time() - loop_t0) * 1000.0
                     if throttle.wait(work_ms) == ord("q"):
                         break
+            timer.lap("compose+view")
 
+            timer.end_frame()
             n += 1
             if max_frames is not None and n >= max_frames:
                 break
 
-        cap_a.release()
-        cap_b.release()
+        reader_a.stop()
+        reader_b.stop()
         mm_writer.release()
         if view_writer is not None:
             view_writer.release()
         pos_writer.close()
+        movement.close()
+        kp_writer.close()
         if show:
             cv2.destroyAllWindows()
         self.identity.save()
 
+        elapsed = time.time() - t0
+        proc_fps = round(n / elapsed, 2) if elapsed > 0 else 0.0
         summary = {
             "frames_processed": n,
+            "processing_fps": proc_fps,
             "offset_frames": self.offset,
             "unique_player_ids_used": sorted(ids_seen),
             "n_unique_ids": len(ids_seen),
         }
         view_msg = f" + combined view -> {self.out_dir}/fusion_view.mp4" if view_writer else ""
-        print(f"[fusion] processed {n} synced frames. ids used: {sorted(ids_seen)} "
-              f"(<=4 by construction). minimap -> {self.out_dir}/fusion_minimap.mp4{view_msg}")
+        print(f"[fusion] processed {n} synced frames in {elapsed:.1f}s ({proc_fps} FPS). "
+              f"ids used: {sorted(ids_seen)} (<=4 by construction). "
+              f"minimap -> {self.out_dir}/fusion_minimap.mp4{view_msg}")
+        timer.report("fusion")
         return summary

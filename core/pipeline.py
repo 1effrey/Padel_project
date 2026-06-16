@@ -23,10 +23,13 @@ from utils import roi as roi_utils
 from utils.colors import color_for_id
 from utils.court_position import player_court_position
 from utils.display import PlaybackThrottle
-from utils.video_io import open_capture
+from utils.profiler import StageTimer
+from utils.video_io import ThreadedVideoReader
 from utils.homography import Homography, draw_court_lines
 from utils.metrics import Metrics, NumpyEncoder
 from utils.minimap import Minimap
+from utils.movement_log import MovementWriter
+from utils.player_keypoint_log import PlayerKeypointWriter
 from utils.skeleton import draw_skeleton
 
 
@@ -56,6 +59,7 @@ def run(
     show: bool = False,
     save_video: bool = False,
     max_frames: Optional[int] = None,
+    profile: bool = False,
 ) -> Dict[str, Any]:
     """Run the Phase-1 pipeline. Returns the metrics summary dict."""
     det_cfg = config["detection"]
@@ -87,6 +91,7 @@ def run(
     minimap = None
     inside_margin = 0.0
     positions_writer = None
+    movement = None          # per-run player-movement CSV (created once fps is known)
     if homog is None:
         print("[pipeline] note: no homography set -> court lines / top-down view "
               "not drawn. Run `python main.py --calibrate-homography` to define it.")
@@ -112,14 +117,25 @@ def run(
                   f"(w_pos={identity.w_pos}, w_color={identity.w_color}, "
                   f"match_threshold={identity.match_threshold}).")
 
-    # --- open the video source (GPU hardware decode when available) ---------
-    cap, _hw_decode = open_capture(
-        config["source"], config.get("decode", {}).get("hw_accel", True))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open source: {config['source']}")
-    fps_in = cap.get(cv2.CAP_PROP_FPS) or trk_cfg.get("frame_rate", 30)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # --- open the video source (GPU hardware decode + background reader) -----
+    # The reader thread decodes the NEXT frame while we run inference on the
+    # current one, so decode overlaps inference. Frames are delivered in order
+    # and never dropped -> output is identical to the old serial read.
+    dec_cfg = config.get("decode", {})
+    reader = ThreadedVideoReader(
+        config["source"], hw_accel=dec_cfg.get("hw_accel", True),
+        queue_size=dec_cfg.get("queue_size", 4))
+    fps_in = reader.fps or trk_cfg.get("frame_rate", 30)
+    w, h = reader.width, reader.height
+
+    # player-movement log (court metres per frame) -> one new CSV per run.
+    # only meaningful with a homography, so gate on it.
+    if homog is not None:
+        movement = MovementWriter(out_dir, config["source"], fps_in)
+
+    # per-player keypoint/bbox CSVs (P1..P4). Routed by the stable ReID id, so this
+    # only makes sense when ReID is ON (otherwise there are no 1..4 ids to split by).
+    kp_writer = PlayerKeypointWriter(out_dir, config["source"]) if identity is not None else None
 
     writer = None
     if save_video:
@@ -138,23 +154,29 @@ def run(
         cv2.resizeWindow("Padel Phase-1", 1280, 720)
 
     metrics = Metrics()
+    timer = StageTimer(profile)   # per-stage timing (no-op unless --profile)
     t0 = time.time()
     n = 0
     while True:
         loop_t0 = time.time()   # start of this frame's work (for playback throttle)
-        ok, frame = cap.read()
+        timer.start_frame()
+        ok, frame = reader.read()
         if not ok:
             break
+        timer.lap("decode")
 
         # the Phase-1 chain, one frame at a time
         raw = detector.detect(frame)
+        timer.lap("detect")
         kept, _removed = roi_utils.filter_detections(raw, polygon)
         tracked = tracker.update(kept)
+        timer.lap("roi+track")
 
         # ReID layer (if on): tag each detection with a stable player_id (1..4).
         # This consumes the tracker output; it never modifies the tracker.
         if identity is not None:
             identity.update(frame, tracked, n)
+        timer.lap("reid")
 
         # draw everything we kept (use the stable id for label + colour when ReID
         # is on, so a player keeps one colour/number across track fragments)
@@ -167,6 +189,7 @@ def run(
             cv2.polylines(frame, [polygon], True, (0, 255, 255), 2)  # court outline
         if homog is not None:
             draw_court_lines(frame, homog)  # service/net/center/base/side lines
+        timer.lap("draw")
 
         # project players onto the court (meters) -> markers, minimap, log
         positions = []
@@ -179,6 +202,12 @@ def run(
                     disp_id = det["track_id"]
                 pos["track_id"] = disp_id
                 positions.append(pos)
+                # per-player keypoint/bbox row, routed by the STABLE ReID id (1..4);
+                # foot_canvas = court metres (per the chosen layout)
+                if kp_writer is not None and det.get("player_id") is not None:
+                    kp_writer.add(det["player_id"], config["source"], n,
+                                  det.get("track_id"), det["bbox"], det["conf"],
+                                  pos["foot_px"], pos["foot_m"], det["keypoints"])
                 # show the chosen foot point + meters on the main frame so a human
                 # can sanity-check the mapping (this IS the quality gate)
                 fx, fy = int(pos["foot_px"][0]), int(pos["foot_px"][1])
@@ -193,11 +222,14 @@ def run(
             if positions_writer is not None:
                 positions_writer.write(
                     json.dumps({"frame": n, "players": positions}, cls=NumpyEncoder) + "\n")
+            if movement is not None:
+                movement.add(n, positions)
 
         metrics.update(len(raw), len(kept), tracked)
 
         if writer is not None:
             writer.write(frame)
+        timer.lap("project+minimap+io")
         if show:
             cv2.imshow("Padel Phase-1", frame)
             # pause only the LEFTOVER of the frame budget after the work above,
@@ -206,15 +238,20 @@ def run(
             if throttle.wait(work_ms) == ord("q"):
                 break
 
+        timer.end_frame()
         n += 1
         if max_frames is not None and n >= max_frames:
             break
 
-    cap.release()
+    reader.stop()
     if writer is not None:
         writer.release()
     if positions_writer is not None:
         positions_writer.close()
+    if movement is not None:
+        movement.close()
+    if kp_writer is not None:
+        kp_writer.close()
     if identity is not None:
         identity.save()   # persist the 4 profiles + flush the assignment log
     if show:
@@ -231,4 +268,5 @@ def run(
     })
     print(f"[pipeline] processed {n} frames in {elapsed:.1f}s "
           f"({proc_fps} FPS). metrics -> {metrics_path}")
+    timer.report("single")
     return summary
