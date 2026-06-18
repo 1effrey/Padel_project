@@ -303,21 +303,36 @@ def run_train(args: argparse.Namespace) -> None:
         print(f"[train] warm-started from {args.warm_start}")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    nw = max(0, int(args.num_workers))
+    pin = dev.type == "cuda"
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                          num_workers=nw, pin_memory=pin,
+                          persistent_workers=(nw > 0))
+    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                        num_workers=nw, pin_memory=pin,
+                        persistent_workers=(nw > 0))
 
     os.makedirs(os.path.dirname(out_weights) or ".", exist_ok=True)
     best_acc = -1.0
     best_val_loss = float("inf")
+    use_amp = args.amp and dev.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    if use_amp:
+        print("[train] mixed-precision (FP16) ON")
     for epoch in range(args.epochs):
         model.train()
         tr_loss = 0.0
         for x, y in train_dl:
-            x, y = x.to(dev), y.to(dev)
+            x = x.to(dev, non_blocking=True)
+            y = y.to(dev, non_blocking=True)
             opt.zero_grad()
-            loss = weighted_bce(model(x), y, pos_weight=args.pos_weight)
-            loss.backward()
-            opt.step()
+            with torch.autocast(device_type=dev.type, enabled=use_amp):
+                pred = model(x)                 # conv in FP16 (fast) when AMP is on
+            # loss in FP32 for numerical safety (the weighted BCE takes logs)
+            loss = weighted_bce(pred.float(), y, pos_weight=args.pos_weight)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             tr_loss += loss.item() * len(x)
         tr_loss /= max(1, len(train_ds))
 
@@ -326,8 +341,11 @@ def run_train(args: argparse.Namespace) -> None:
         hits = seen = 0
         with torch.no_grad():
             for x, y in val_dl:
-                x, y = x.to(dev), y.to(dev)
-                pred = model(x)
+                x = x.to(dev, non_blocking=True)
+                y = y.to(dev, non_blocking=True)
+                with torch.autocast(device_type=dev.type, enabled=use_amp):
+                    pred = model(x)
+                pred = pred.float()
                 val_loss += weighted_bce(pred, y, pos_weight=args.pos_weight).item() * len(x)
                 h, n = loc_hits(pred, y, tol_px=args.tol_px)
                 hits += h
@@ -372,6 +390,14 @@ def main() -> None:
     p.add_argument("--pos-weight", type=float, default=50.0, help="up-weight ball pixels in BCE")
     p.add_argument("--tol-px", type=float, default=4.0, help="localization hit tolerance (net px)")
     p.add_argument("--device", help="cuda / cpu (default: config device)")
+    # SPEED (opt-in; defaults keep the laptop behaviour unchanged). On a big cloud GPU
+    # the data loader, not the GPU, is the bottleneck -- parallel workers + a larger
+    # batch + mixed precision keep the GPU fed. Use --num-workers 0 on Windows (the
+    # cached dataset pickles badly under 'spawn'); 8 is great on a Linux pod.
+    p.add_argument("--num-workers", type=int, default=0,
+                   help="DataLoader workers (0 = laptop/Windows-safe; 8 on a Linux pod)")
+    p.add_argument("--amp", action="store_true",
+                   help="mixed-precision (FP16) training -- faster on CUDA, no quality change")
     p.add_argument("--dry-run", action="store_true", help="check the data path, don't train")
     p.add_argument("--smoke", action="store_true", help="prove the machinery on random data")
     args = p.parse_args()

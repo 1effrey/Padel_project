@@ -64,7 +64,7 @@
     "input_width": 512,
     "input_height": 288,
     "in_frames": 3,
-    "heatmap_threshold": 0.5,
+    "heatmap_threshold": 0.3,
     "min_blob_area": 2,
     "method": "tracknet",
     "label_stride": 2,
