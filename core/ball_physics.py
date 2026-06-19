@@ -441,12 +441,13 @@ class ProjectileEKF:
     def __init__(self, camera, H: np.ndarray, fps: float, meas_px: float = 15.0,
                  q_pos: float = 0.02, q_vel: float = 6.0, q_pos_z: float = 0.01,
                  q_vel_z: float = 0.5, restitution: float = 0.7,
-                 bounce_z_thresh: float = 0.7) -> None:
+                 bounce_z_thresh: float = 0.7, z_max: float = 8.0) -> None:
         self.cam = camera
         self.H = H
         self.dt = 1.0 / fps
         self.restitution = restitution
         self.bounce_z = bounce_z_thresh
+        self.z_max = z_max
         dt = self.dt
         self.F = np.eye(6)
         for i in range(3):
@@ -513,19 +514,21 @@ class ProjectileEKF:
         self.s[5] = abs(self.restitution * self.s[5])
 
     def constrain_floor(self) -> None:
-        """Physical prior: the ball is never below the court floor. When the state dips
-        below z=0, pull it back with a soft z=0 pseudo-measurement (also corrects the
-        depth that drove it there). Cheap, principled, and keeps Z in a sane band even
-        between sparse bounce anchors."""
-        if self.s[2] < 0.0:
-            Hj = np.zeros((1, 6))
-            Hj[0, 2] = 1.0
-            R = np.array([[0.05]])
-            y = np.array([0.0 - self.s[2]])
-            S = Hj @ self.P @ Hj.T + R
-            K = self.P @ Hj.T @ np.linalg.inv(S)
-            self.s = self.s + (K @ y).ravel()
-            self.P = (np.eye(6) - K @ Hj) @ self.P
+        """Physical prior: a padel ball stays between the floor and ~8 m. When the state
+        leaves that band (an unobserved-depth drift), pull it back with a soft pseudo-
+        measurement. Cheap, principled, and keeps Z sane between sparse anchors."""
+        z = self.s[2]
+        target = 0.0 if z < 0.0 else (self.z_max if z > self.z_max else None)
+        if target is None:
+            return
+        Hj = np.zeros((1, 6))
+        Hj[0, 2] = 1.0
+        R = np.array([[0.05]])
+        y = np.array([target - z])
+        S = Hj @ self.P @ Hj.T + R
+        K = self.P @ Hj.T @ np.linalg.inv(S)
+        self.s = self.s + (K @ y).ravel()
+        self.P = (np.eye(6) - K @ Hj) @ self.P
 
     def update_3d(self, point3d: Tuple[float, float, float],
                   sigma3: Tuple[float, float, float]) -> None:
@@ -573,17 +576,49 @@ def _load_fusion(path: str
     return out
 
 
+def _rts_smooth(fwd: List[Dict[str, Any]], F: np.ndarray, z_max: float = 8.0
+                ) -> List[Tuple[int, float, float, float]]:
+    """Rauch-Tung-Striebel backward pass: re-estimate every frame using the FUTURE
+    anchors too. This is what tames the height -- between two sparse anchors the forward
+    filter EXTRAPOLATES (and drifts), but the smoother INTERPOLATES, pinning each frame
+    from both sides. The chain is broken at bounce frames: a bounce is a velocity cusp,
+    so we never smooth a falling arc into the rising one across it."""
+    n = len(fwd)
+    if n == 0:
+        return []
+    s_sm = [r["s_post"].copy() for r in fwd]
+    P_sm = [r["P_post"].copy() for r in fwd]
+    for k in range(n - 2, -1, -1):
+        if fwd[k + 1]["brk"]:                              # bounce at k+1 -> don't cross it
+            continue
+        Pp = fwd[k + 1]["P_prior"]
+        try:
+            C = fwd[k]["P_post"] @ F.T @ np.linalg.inv(Pp)
+        except np.linalg.LinAlgError:
+            continue
+        s_sm[k] = fwd[k]["s_post"] + C @ (s_sm[k + 1] - fwd[k + 1]["s_prior"])
+        P_sm[k] = fwd[k]["P_post"] + C @ (P_sm[k + 1] - Pp) @ C.T
+    # Final physical clamp: the ball lives in [floor, z_max]. The smoother can overshoot
+    # the band in unanchored stretches (depth is unobserved there); bound it to plausible.
+    return [(fwd[k]["frame"], float(s_sm[k][0]), float(s_sm[k][1]),
+             float(min(z_max, max(0.0, s_sm[k][2])))) for k in range(n)]
+
+
+def _height_stats(traj: List[Tuple[int, float, float, float]]) -> Tuple[float, ...]:
+    z = np.array([t[3] for t in traj]) if traj else np.array([0.0])
+    return (float(z.min()), float(np.median(z)), float(z.max()),
+            100.0 * float((z < -0.05).mean()), 100.0 * float((z > 6.0).mean()))
+
+
 def run_ekf(jsonl_path: str, config: Dict[str, Any], fps: Optional[float] = None,
-            fusion_path: Optional[str] = None
+            fusion_path: Optional[str] = None, smooth: bool = True,
+            exclude: Optional[set] = None
             ) -> Tuple[List[Tuple[int, float, float, float]], Any]:
-    """Step 3 / 3b: reconstruct the dense 3D trajectory with the projectile EKF.
+    """Step 3 / 3b / 3c: reconstruct the dense 3D trajectory with the projectile EKF, then
+    (Step 3c) an RTS smoother that uses future anchors to interpolate the height.
 
-    If `fusion_path` (Phase-4 ball_fusion.jsonl) is given, the TRIANGULATED 3D points are
-    injected as strong depth anchors -- THIS is what makes height observable (Step 3b).
-    Without it the filter is single-camera and height is under-constrained (Step 3).
-
-    Returns (trajectory, camera) where trajectory is [(frame, x, y, z), ...] for every
-    frame from first detection onward (gaps included -- those are predict-only)."""
+    `fusion_path` (Phase-4 ball_fusion.jsonl) injects TRIANGULATED 3D points as depth
+    anchors. `smooth` adds the backward smoothing pass. Returns (trajectory, camera)."""
     pts, evs = load_track(jsonl_path)
     H = np.array(config["homography"]["H"], dtype=float)
     if fps is None:
@@ -595,42 +630,93 @@ def run_ekf(jsonl_path: str, config: Dict[str, Any], fps: Optional[float] = None
     ev_frames = {e.frame: e for e in evs if e.type == "floor_bounce"}
     cusps = _cusp_frames(pts)
     fusion = _load_fusion(fusion_path) if fusion_path else {}
+    exclude = exclude or set()                             # anchors to hold out (validation)
     n_tri = 0
 
-    traj: List[Tuple[int, float, float, float]] = []
+    fwd: List[Dict[str, Any]] = []                         # per-frame records for the RTS pass
+    traj_fwd: List[Tuple[int, float, float, float]] = []
     inited = False
     for p in pts:
         if not inited:
-            if p.frame in fusion:                          # best: init from a 3D point
+            if p.frame in fusion and p.frame not in exclude:   # best: init from a 3D point
                 x, y, z, _ = fusion[p.frame]
                 ekf.init((x, y))
                 ekf.s[2] = z
-                inited = True
-                traj.append((p.frame, *ekf.state()[:3]))
             elif p.measured and p.u is not None:
                 ekf.init(_image_to_court(p.u, p.v, H))
-                inited = True
-                traj.append((p.frame, *ekf.state()[:3]))
+            else:
+                continue
+            inited = True
+            fwd.append({"frame": p.frame, "s_prior": ekf.s.copy(), "P_prior": ekf.P.copy(),
+                        "s_post": ekf.s.copy(), "P_post": ekf.P.copy(), "brk": False})
+            traj_fwd.append((p.frame, *ekf.state()[:3]))
             continue
         ekf.predict()
+        s_prior, P_prior = ekf.s.copy(), ekf.P.copy()      # the F-prediction (for RTS gain)
         if p.measured and p.u is not None:
             ekf.update_2d(p.u, p.v, p.confidence)
-        if p.frame in fusion:                              # triangulated 3D -> depth anchor
+        if p.frame in fusion and p.frame not in exclude:   # triangulated 3D -> depth anchor
             x, y, z, std = fusion[p.frame]
             ekf.update_3d((x, y, z), std)
             n_tri += 1
+        is_bounce = False
         if p.frame in ev_frames:                           # confirmed bounce
             e = ev_frames[p.frame]
             if e.x_m is not None and e.y_m is not None:
                 ekf.anchor_floor(e.x_m, e.y_m)
             ekf.bounce_flip()
+            is_bounce = True
         elif p.frame in cusps and ekf.s[2] < ekf.bounce_z:   # soft cue, height-gated
+            # A low cusp is almost certainly an undetected floor bounce -> anchor z=0 at
+            # the floor position (homography is valid here, the ball is on the ground),
+            # then flip vertical velocity. These extra z=0 anchors shorten the unanchored
+            # spans and tighten the height between sparse triangulations.
+            if p.track_x is not None and p.track_y is not None:
+                cx, cy = _image_to_court(p.track_x, p.track_y, H)
+                ekf.anchor_floor(cx, cy)
             ekf.bounce_flip()
+            is_bounce = True
         ekf.constrain_floor()                              # ball never below the floor
-        traj.append((p.frame, *ekf.state()[:3]))
+        fwd.append({"frame": p.frame, "s_prior": s_prior, "P_prior": P_prior,
+                    "s_post": ekf.s.copy(), "P_post": ekf.P.copy(), "brk": is_bounce})
+        traj_fwd.append((p.frame, *ekf.state()[:3]))
+
     print(f"[physics]   depth anchors: {n_tri} triangulated 3D points"
           f"{'  (NONE found -> single-camera mode, height weak)' if not fusion else ''}")
-    return traj, cam
+    if not smooth:
+        return traj_fwd, cam
+    traj_sm = _rts_smooth(fwd, ekf.F, ekf.z_max)
+    fz, sz = _height_stats(traj_fwd), _height_stats(traj_sm)
+    print(f"[physics]   height Z  forward  : min {fz[0]:6.1f}  med {fz[1]:5.2f}  "
+          f"max {fz[2]:6.1f}   (<0 {fz[3]:.0f}%, >6m {fz[4]:.0f}%)")
+    print(f"[physics]   height Z  SMOOTHED : min {sz[0]:6.1f}  med {sz[1]:5.2f}  "
+          f"max {sz[2]:6.1f}   (<0 {sz[3]:.0f}%, >6m {sz[4]:.0f}%)  <- RTS")
+    return traj_sm, cam
+
+
+def validate_height(jsonl_path: str, config: Dict[str, Any], fusion_path: str,
+                    fps: Optional[float] = None, holdout_frac: float = 0.3,
+                    seed: int = 0) -> None:
+    """MEASURE height accuracy. The triangulated anchors are our only 3D ground truth, so:
+    hold out a fraction of them, reconstruct the trajectory WITHOUT them, then compare the
+    recovered height at those frames to their true triangulated height. This scores how
+    well the filter+smoother INTERPOLATES height between anchors -- the thing we're tuning."""
+    import random
+    fusion = _load_fusion(fusion_path)
+    frames = sorted(fusion.keys())
+    if len(frames) < 6:
+        print(f"[height-val] only {len(frames)} triangulated anchors -- too few to score.")
+        return
+    rng = random.Random(seed)
+    holdout = set(rng.sample(frames, max(1, int(len(frames) * holdout_frac))))
+    traj, _ = run_ekf(jsonl_path, config, fps=fps, fusion_path=fusion_path, exclude=holdout)
+    zby = {f: z for (f, _x, _y, z) in traj}
+    errs = [abs(zby[f] - fusion[f][2]) for f in holdout if f in zby]
+    if errs:
+        e = np.array(errs)
+        print(f"[height-val] held out {len(holdout)}/{len(frames)} triangulated anchors -> "
+              f"recovered-height error there: median {np.median(e):.2f}m  mean {e.mean():.2f}m"
+              f"  p90 {np.percentile(e, 90):.2f}m")
 
 
 def report_ekf(traj: List[Tuple[int, float, float, float]], pts: List[TrackPoint],

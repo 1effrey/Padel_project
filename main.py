@@ -342,6 +342,12 @@ def main() -> None:
     parser.add_argument("--profile", action="store_true", help="print a per-stage timing breakdown at the end")
     parser.add_argument("--ball-eval", action="store_true",
                         help="run the Phase-1 ball-detector quality gate on --source and exit")
+    parser.add_argument("--ball-3d", action="store_true",
+                        help="end-to-end 3D ball pipeline (dual-cam triangulate + physics) "
+                             "-> output/ball_3d_trajectory.csv; needs --config2")
+    parser.add_argument("--ball-dual", action="store_true",
+                        help="live side-by-side dual-cam ball view + top-down court with one "
+                             "cross-camera ball; needs --config2")
     parser.add_argument("--label-ball", action="store_true",
                         help="open the click-to-label ball tool on --source and exit")
     parser.add_argument("--label-from",
@@ -424,6 +430,27 @@ def main() -> None:
         config_b = load_config(args.config2)
         run_ball_fusion(config, config_b, show=args.show, save_video=args.save_video,
                         max_frames=args.max_frames, start_frame=args.start_frame)
+        return
+
+    if args.ball_3d:
+        # End-to-end 3D ball pipeline: Phase-4 dual-cam triangulation + side-1 track/events,
+        # then Phase-5 projectile EKF + RTS smoother -> 3D trajectory CSV (+ overlay).
+        if not args.config2:
+            parser.error("--ball-3d requires --config2 (the second camera's config)")
+        from core.ball_3d import run_ball_3d
+        config_b = load_config(args.config2)
+        run_ball_3d(config, config_b, max_frames=args.max_frames,
+                    save_video=args.save_video, show=args.show)
+        return
+
+    if args.ball_dual:
+        # Live side-by-side dual-camera ball view + top-down court with one cross-camera ball.
+        if not args.config2:
+            parser.error("--ball-dual requires --config2 (the second camera's config)")
+        from core.ball_dual import run_dual_view
+        config_b = load_config(args.config2)
+        run_dual_view(config, config_b, max_frames=args.max_frames,
+                      show=args.show, save_video=args.save_video)
         return
 
     run(config, show=args.show, save_video=args.save_video,
