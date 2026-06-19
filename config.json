@@ -61,8 +61,8 @@
   "ball": {
     "enabled": false,
     "weights": "weights/ball_tracknet_v2.pt",
-    "input_width": 512,
-    "input_height": 288,
+    "input_width": 1280,
+    "input_height": 720,
     "in_frames": 3,
     "heatmap_threshold": 0.3,
     "min_blob_area": 2,
