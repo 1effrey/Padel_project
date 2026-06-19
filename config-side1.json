@@ -216,9 +216,9 @@
   },
   "sync": {
     "other_source": "side-2-full-vid.mp4",
-    "offset_frames": 54,
-    "method": "clock-tick",
-    "note": "side-B frame = side-A frame + 54 (2.70s @20.01fps). Frame-exact: side-A clock ticks :50->:51 at frame 1009, side-B at frame 1063 (1063-1009=54); confirmed no drift at f~20000. Geometry net-coincidence sweep corroborates (flat ~0.7-0.85m for offsets 46-58, rising past 60). Motion-energy xcorr was ambiguous and is not used.",
+    "offset_frames": 37,
+    "method": "manual",
+    "note": "manually aligned by eye: side-B frame = side-A + 37 (1.850s @ 20.01fps).",
     "uncertainty_frames": 1
   }
 }
