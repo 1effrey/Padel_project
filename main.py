@@ -348,6 +348,9 @@ def main() -> None:
     parser.add_argument("--ball-dual", action="store_true",
                         help="live side-by-side dual-cam ball view + top-down court with one "
                              "cross-camera ball; needs --config2")
+    parser.add_argument("--sync-manual", action="store_true",
+                        help="interactive by-eye sync tuner (nudge the frame offset) -> saves "
+                             "to config-A; needs --config2")
     parser.add_argument("--label-ball", action="store_true",
                         help="open the click-to-label ball tool on --source and exit")
     parser.add_argument("--label-from",
@@ -451,6 +454,15 @@ def main() -> None:
         config_b = load_config(args.config2)
         run_dual_view(config, config_b, max_frames=args.max_frames,
                       show=args.show, save_video=args.save_video)
+        return
+
+    if args.sync_manual:
+        # Interactive by-eye sync tuner: nudge the frame offset, save to config-A.
+        if not args.config2:
+            parser.error("--sync-manual requires --config2 (the second camera's config)")
+        from core.sync_manual import run_manual_sync
+        config_b = load_config(args.config2)
+        run_manual_sync(config, config_b, args.config)
         return
 
     run(config, show=args.show, save_video=args.save_video,

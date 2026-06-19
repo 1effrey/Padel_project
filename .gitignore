@@ -12,9 +12,6 @@
 # Bundled library folder (reinstalled via requirements.txt)
 pytorch_lightning/
 
-# Teammate's separate repo (was accidentally nested here; keep it out)
-padel_computer_vision/
-
 # Python cache
 __pycache__/
 *.pyc
