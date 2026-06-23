@@ -61,9 +61,15 @@
   "ball": {
     "enabled": false,
     "weights": "weights/ball_tracknet_v2.pt",
-    "input_width": 1280,
-    "input_height": 720,
+    "input_width": 768,
+    "input_height": 768,
     "in_frames": 3,
+    "crop": {
+      "enabled": true,
+      "x_min": 0, "y_min": 224, "x_max": 3840, "y_max": 2160,
+      "out_size": 768,
+      "note": "derived from court.polygon bbox + margins (top=400 lob airspace, sides=80, bottom=60), clamped to 3840x2160; force-scaled to out_size x out_size (anamorphic)."
+    },
     "heatmap_threshold": 0.3,
     "min_blob_area": 2,
     "method": "tracknet",

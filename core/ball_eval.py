@@ -92,6 +92,7 @@ def _build_detector(config: Dict[str, Any]):
         min_blob_area=ball.get("min_blob_area", 2),
         court_polygon=(court_poly if roi_on else None),
         roi_margin_px=roi_margin,
+        crop=ball.get("crop"),                 # court-crop box (or None) -> ball-only
     )
 
 

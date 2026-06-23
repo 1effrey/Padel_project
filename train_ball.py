@@ -36,7 +36,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from core.ball_detector import (TrackNetV2, make_gaussian_heatmap, preprocess_frame)
+from core.ball_detector import (TrackNetV2, label_to_net, make_gaussian_heatmap,
+                                preprocess_frame, resolve_crop)
 from core.ball_label import _csv_path, _load_existing
 
 
@@ -70,10 +71,13 @@ class BallDataset(Dataset):
     """
 
     def __init__(self, clips: List[Dict[str, Any]], net_w: int, net_h: int,
-                 in_frames: int, sigma: float) -> None:
+                 in_frames: int, sigma: float,
+                 crop: Optional[Dict[str, Any]] = None) -> None:
         self.clips = clips
         self.net_w, self.net_h = int(net_w), int(net_h)
         self.in_frames, self.sigma = int(in_frames), float(sigma)
+        self.crop = crop                 # court-crop box (or None) -- see resolve_crop
+        self._aug_idx: set = set()       # sample indices to augment (TRAIN split only)
         self._failed_idx: set = set()    # samples whose frames could not be read
 
         self.samples: List[tuple] = []   # (clip_idx, center_idx, visible, u, v)
@@ -108,13 +112,60 @@ class BallDataset(Dataset):
                 if not ok:
                     break
                 if cur in needed:
-                    self._cache[ci][cur] = cv2.resize(fr, (self.net_w, self.net_h))
+                    self._cache[ci][cur] = self._crop_resize(fr)
                 if cur % 1000 == 0:
                     print(f"[train]   ...scanned {cur}/{end} "
                           f"({len(self._cache[ci])} cached)")
                 cur += 1
             cap.release()
             print(f"[train]   cached {len(self._cache[ci])}/{len(needed)} frames.")
+
+    # -------- court crop + compression-defence augmentation (training time) -----
+    def _crop_resize(self, frame: np.ndarray) -> np.ndarray:
+        """Court-crop (if configured) then AREA-resize to net size -- the SAME crop the
+        detector applies at inference, so train and infer see identical geometry."""
+        box = resolve_crop(self.crop, frame.shape[1], frame.shape[0])
+        if box is not None:
+            x0, y0, x1, y1 = box
+            frame = frame[y0:y1, x0:x1]
+        return cv2.resize(frame, (self.net_w, self.net_h), interpolation=cv2.INTER_AREA)
+
+    def set_augment_indices(self, idxs) -> None:
+        """Augment ONLY these (training) sample indices; val / dry-run stay clean."""
+        self._aug_idx = set(int(i) for i in idxs)
+
+    @staticmethod
+    def _motion_kernel(size: int, angle_deg: float) -> np.ndarray:
+        """Normalised line kernel for directional motion blur (the fast-ball smear)."""
+        k = np.zeros((size, size), np.float32)
+        k[size // 2, :] = 1.0
+        m = cv2.getRotationMatrix2D((size / 2 - 0.5, size / 2 - 0.5), angle_deg, 1.0)
+        k = cv2.warpAffine(k, m, (size, size))
+        s = float(k.sum())
+        return k / s if s > 0 else k
+
+    def _augment_stack(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+        """Simulate the ~1950 kbps HIK feed so TrackNet learns the smeared / blocky
+        ball. The SAME params hit every frame in the stack (consecutive frames share
+        one codec/exposure). Two effects, each applied with a probability:
+          1) JPEG re-encode at low quality  -> macroblock + ringing artefacts
+          2) directional linear motion blur -> the fast-ball temporal smear
+        Applied to the INPUT frames only; the target heatmap is never touched."""
+        rng = np.random.default_rng()
+        out = frames
+        if rng.random() < 0.85:                          # compression blockiness
+            q = int(rng.integers(18, 41))                # lower q = blockier
+            enc = [int(cv2.IMWRITE_JPEG_QUALITY), q]
+            tmp = []
+            for f in out:
+                ok, buf = cv2.imencode(".jpg", f, enc)
+                tmp.append(cv2.imdecode(buf, cv2.IMREAD_COLOR) if ok else f)
+            out = tmp
+        if rng.random() < 0.5:                           # fast-ball motion smear
+            size = int(rng.integers(3, 12)) | 1          # odd kernel 3..11
+            kernel = self._motion_kernel(size, float(rng.uniform(0.0, 180.0)))
+            out = [cv2.filter2D(f, -1, kernel) for f in out]
+        return out
 
     def close(self) -> None:
         """Free the cached frames."""
@@ -139,11 +190,16 @@ class BallDataset(Dataset):
             x = np.zeros((3 * self.in_frames, self.net_h, self.net_w), dtype=np.float32)
             u_net = v_net = None
         else:
+            if i in self._aug_idx:                  # TRAIN-only compression+blur aug
+                wins = self._augment_stack(wins)
+            # wins are already crop+resized to net size -> preprocess just does RGB/CHW
             x = np.concatenate(
                 [preprocess_frame(w, self.net_w, self.net_h) for w in wins], axis=0)
             if vis:
-                u_net = u * self.net_w / clip["orig_w"]
-                v_net = v * self.net_h / clip["orig_h"]
+                # crop-aware: SAME transform the detector inverts, so the Gaussian
+                # peak lands exactly where the ball is in the cropped 768 canvas.
+                u_net, v_net = label_to_net(u, v, self.net_w, self.net_h,
+                                            clip["orig_w"], clip["orig_h"], self.crop)
             else:
                 u_net = v_net = None
         y = make_gaussian_heatmap(self.net_w, self.net_h, u_net, v_net, self.sigma)
@@ -269,7 +325,8 @@ def run_train(args: argparse.Namespace) -> None:
               "        python main.py --config config-side1.json --label-ball")
         return
 
-    ds = BallDataset(clips, net_w, net_h, in_frames, sigma=args.sigma)
+    crop = ball.get("crop")
+    ds = BallDataset(clips, net_w, net_h, in_frames, sigma=args.sigma, crop=crop)
     if len(ds) == 0:
         print("[train] Dataset is empty (labels too early in the clip for a stack?).")
         ds.close()
@@ -292,9 +349,17 @@ def run_train(args: argparse.Namespace) -> None:
     idxs = list(range(len(ds)))
     random.Random(0).shuffle(idxs)
     n_val = min(max(1, int(len(ds) * args.val_frac)), len(ds) - 1)
+    train_idx = idxs[n_val:]
     val_ds = Subset(ds, idxs[:n_val])
-    train_ds = Subset(ds, idxs[n_val:])
+    train_ds = Subset(ds, train_idx)
     print(f"[train] {len(ds)} samples -> {len(train_ds)} train / {len(val_ds)} val")
+    crop_box = resolve_crop(crop, clips[0]["orig_w"], clips[0]["orig_h"])
+    print(f"[train] court crop: {crop_box if crop_box else 'OFF (full-frame)'} "
+          f"-> net {net_w}x{net_h}")
+    if not args.no_aug:
+        ds.set_augment_indices(train_idx)
+        print("[train] compression+motion-blur augmentation ON for the train split "
+              "(simulates ~1950 kbps HIK feed; val left clean).")
 
     dev = _pick_device(args.device or base_cfg.get("device", "cuda"))
     model = TrackNetV2(in_frames=in_frames).to(dev)
@@ -398,6 +463,8 @@ def main() -> None:
                    help="DataLoader workers (0 = laptop/Windows-safe; 8 on a Linux pod)")
     p.add_argument("--amp", action="store_true",
                    help="mixed-precision (FP16) training -- faster on CUDA, no quality change")
+    p.add_argument("--no-aug", action="store_true",
+                   help="disable the ~1950 kbps compression + motion-blur augmentation")
     p.add_argument("--dry-run", action="store_true", help="check the data path, don't train")
     p.add_argument("--smoke", action="store_true", help="prove the machinery on random data")
     args = p.parse_args()
