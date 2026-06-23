@@ -18,7 +18,7 @@ MOVING ball from a PARKED one:
                                hit/bounce. Reported as a speed distribution + counts
                                under several thresholds (so we don't hard-code "slow").
 
-A candidate is optionally passed through the YELLOW gate (same as ball_dual) so we count
+A candidate is optionally passed through the YELLOW gate (see _is_yellow below) so we count
 ball-LIKE blobs, not lights/limbs. Everything is a proxy -- the point is the ORDER OF
 MAGNITUDE (rare vs common), to decide whether the arbitration layer is worth building.
 
@@ -35,13 +35,30 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from core.ball_dual import _is_yellow
 from core.ball_eval import _build_detector, _build_events, _build_tracker
 from utils.homography import Homography
 from utils.metrics import NumpyEncoder
 from utils.video_io import ThreadedVideoReader
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# Optic-yellow padel ball in HSV (OpenCV H is 0-180). Lenient S/V -- the ball is small,
+# bright and motion-blurred, so we only ask for a SLICE of yellow-green pixels.
+# (Inlined here when the 3D dual-camera view was removed; this is the last consumer.)
+_YELLOW_LO = np.array([22, 50, 50], dtype=np.uint8)
+_YELLOW_HI = np.array([45, 255, 255], dtype=np.uint8)
+
+
+def _is_yellow(frame: np.ndarray, u: float, v: float, r: int = 12,
+               frac: float = 0.06) -> bool:
+    """True if the patch around (u, v) is yellowish enough to be the ball."""
+    h, w = frame.shape[:2]
+    x0, x1 = max(0, int(u - r)), min(w, int(u + r))
+    y0, y1 = max(0, int(v - r)), min(h, int(v + r))
+    if x1 <= x0 or y1 <= y0:
+        return False
+    hsv = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+    return float((cv2.inRange(hsv, _YELLOW_LO, _YELLOW_HI) > 0).mean()) >= frac
 
 
 # --------------------------------------------------------------------------- #
