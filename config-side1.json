@@ -101,6 +101,8 @@
       "wall_margin_m": 0.6,
       "hit_angle_deg": 70,
       "hit_min_speed_px_s": 1500,
+      "hit_min_speed_gain_px_s": 800,
+      "racket_reach_px": 150,
       "refractory_frames": 3,
       "in_out_margin_m": 0.1
     }

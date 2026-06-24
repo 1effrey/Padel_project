@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections import deque
+from collections import defaultdict, deque
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -170,15 +170,18 @@ def _build_events(config: Dict[str, Any], homography):
         wall_margin_m=e.get("wall_margin_m", 0.6),
         hit_angle_deg=e.get("hit_angle_deg", 70.0),
         hit_min_speed_px_s=e.get("hit_min_speed_px_s", 1500.0),
+        hit_min_speed_gain_px_s=e.get("hit_min_speed_gain_px_s", 800.0),
+        racket_reach_px=e.get("racket_reach_px", 150.0),
         refractory_frames=e.get("refractory_frames", 3),
         in_out_margin_m=e.get("in_out_margin_m", 0.1),
     )
 
 
 def _draw_events(frame: np.ndarray, recent_events, cur_frame: int, ttl: int = 25) -> None:
-    """Mark recent events: green diamond = floor bounce, orange = wall, red = hit.
-    The label (with in/out + court metres) shows for the first few frames."""
-    colors = {"floor_bounce": (0, 255, 0), "wall_bounce": (255, 128, 0), "hit": (0, 0, 255)}
+    """Mark recent events: green diamond = floor bounce, orange = wall, red = hit,
+    magenta = player hit. The label (in/out + court metres) shows for a few frames."""
+    colors = {"floor_bounce": (0, 255, 0), "wall_bounce": (255, 128, 0),
+              "hit": (0, 0, 255), "player_hit": (255, 0, 255)}
     for fno, ev in recent_events:
         age = cur_frame - fno
         if age > ttl:
@@ -234,7 +237,7 @@ def run_ball_eval(
     homog = Homography.from_config(config)
     events = _build_events(config, homog)
     recent_events: "deque" = deque(maxlen=90)   # for persistent on-frame markers
-    event_counts = {"floor_bounce": 0, "wall_bounce": 0, "hit": 0}
+    event_counts = defaultdict(int)   # floor_bounce | wall_bounce | hit | player_hit
     if events is not None and homog is None:
         print("[ball-eval] note: no homography in this config -> events fire but lack "
               "court metres / in-out. Use config-side1.json for full Phase-3 output.")
@@ -418,7 +421,8 @@ def run_ball_eval(
                   f"{summary['detection_rate']*100:.1f}% raw")
         if events is not None:
             print(f"[ball-eval] events: {event_counts['floor_bounce']} floor bounces, "
-                  f"{event_counts['wall_bounce']} wall bounces, {event_counts['hit']} hits")
+                  f"{event_counts['wall_bounce']} wall bounces, {event_counts['hit']} hits, "
+                  f"{event_counts['player_hit']} player hits")
     print(f"[ball-eval] metrics -> {metrics_path}")
     print(f"[ball-eval] per-frame log -> {os.path.join(out_dir, 'ball_eval.jsonl')}")
     return summary
