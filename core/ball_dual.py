@@ -143,28 +143,29 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
         seenA = measA and (not yellow_gate or _is_yellow(fA, *uvA))   # "yellow + moving"
         seenB = measB and (not yellow_gate or _is_yellow(fB, *uvB))
 
-        # --- ball position ON THE MAP via the calibrated HOMOGRAPHY (the SAME mapping that
-        #     draws the court lines / locates the players), so the ball lands consistently
-        #     with the court instead of the separate, misaligned camera-calib floor model.
-        #     Triangulation is used ONLY for the real height z -- and only when both cameras
-        #     see the ball AND agree; otherwise z stays blank (never assumed 0). ---
+        # --- ball court position. TRIANGULATION (both cameras) is the reliable 3D: it places
+        #     the ball correctly even when AIRBORNE, and gives x, y AND the real height z.
+        #     A SINGLE camera can only FLOOR-project (homography, z=0) -- correct for a ball
+        #     near the ground, but it flies far off-court for an airborne ball. So a single-
+        #     cam position is kept ONLY if it lands on/near the court; a wildly off-court
+        #     projection (an airborne ball) is dropped rather than placed wrong. z stays
+        #     blank unless triangulated -- never assumed 0. ---
         court = source = color = None
-        court_z = None                                   # height (m); real only when 3D
-        pa = homA.pixel_to_meters(uvA) if (seenA and homA is not None) else None
-        pb = homB.pixel_to_meters(uvB) if (seenB and homB is not None) else None
-        if pa is not None and pb is not None:            # both cameras see the ball
+        court_z = None
+        if seenA and seenB:
             res = triangulate_ball(camA, camB, uvA, uvB, max_reproj)
             if res is not None:
-                court_z = float(res["X"][2])             # real triangulated height (m)
-            court = ((pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0)   # avg the two floor maps
-            source, color = ("both (3D)" if court_z is not None else "both"), (0, 220, 0)
-            n_both += 1
-        elif pa is not None:                             # side-1 only -> homography floor map
-            court = pa
-            source, color, n_a = "side-1", (0, 220, 220), n_a + 1
-        elif pb is not None:                             # side-2 only -> homography floor map
-            court = pb
-            source, color, n_b = "side-2", (255, 180, 0), n_b + 1
+                court = (float(res["X"][0]), float(res["X"][1]))    # triangulated x, y (in-bounds)
+                court_z = float(res["X"][2])                        # real triangulated height (m)
+                source, color, n_both = "both (3D)", (0, 220, 0), n_both + 1
+        if court is None and seenA and homA is not None:
+            p = homA.pixel_to_meters(uvA)
+            if -2.0 <= p[0] <= 12.0 and -2.0 <= p[1] <= 22.0:       # on/near court only
+                court, source, color, n_a = p, "side-1", (0, 220, 220), n_a + 1
+        if court is None and seenB and homB is not None:
+            p = homB.pixel_to_meters(uvB)
+            if -2.0 <= p[0] <= 12.0 and -2.0 <= p[1] <= 22.0:
+                court, source, color, n_b = p, "side-2", (255, 180, 0), n_b + 1
 
         # --- per-frame ball-location log: cam1/cam2 image px + shared court x/y/z (m) ---
         cw.writerow([
