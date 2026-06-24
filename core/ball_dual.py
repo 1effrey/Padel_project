@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import csv
 import os
+from collections import deque
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
@@ -103,6 +104,7 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     trkA, _ = _build_tracker(cfg_a, fps)
     trkB, _ = _build_tracker(cfg_b, fps)
     mm = Minimap(scale_px_per_m=cfg_a.get("minimap", {}).get("scale_px_per_m", 30))
+    trail = deque(maxlen=int(cfg_a.get("ball", {}).get("tracker", {}).get("trail_len", 30)))
     max_reproj = float(cfg_a.get("ball", {}).get("fusion", {}).get("max_reproj_px", 40.0))
 
     writer = None
@@ -141,22 +143,27 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
         seenA = measA and (not yellow_gate or _is_yellow(fA, *uvA))   # "yellow + moving"
         seenB = measB and (not yellow_gate or _is_yellow(fB, *uvB))
 
-        # --- shared court position: triangulate if both, else whichever camera sees it ---
+        # --- ball position ON THE MAP via the calibrated HOMOGRAPHY (the SAME mapping that
+        #     draws the court lines / locates the players), so the ball lands consistently
+        #     with the court instead of the separate, misaligned camera-calib floor model.
+        #     Triangulation is used ONLY for the real height z -- and only when both cameras
+        #     see the ball AND agree; otherwise z stays blank (never assumed 0). ---
         court = source = color = None
         court_z = None                                   # height (m); real only when 3D
-        if seenA and seenB:
+        pa = homA.pixel_to_meters(uvA) if (seenA and homA is not None) else None
+        pb = homB.pixel_to_meters(uvB) if (seenB and homB is not None) else None
+        if pa is not None and pb is not None:            # both cameras see the ball
             res = triangulate_ball(camA, camB, uvA, uvB, max_reproj)
             if res is not None:
-                court = (float(res["X"][0]), float(res["X"][1]))
-                court_z = float(res["X"][2])             # triangulated height above floor (m)
-                source, color, n_both = "both (3D)", (0, 220, 0), n_both + 1
-        if court is None and seenA:
-            court = _floor_point(camA, *uvA)
-            # z stays BLANK: a single camera cannot measure height -- do NOT assume 0.
+                court_z = float(res["X"][2])             # real triangulated height (m)
+            court = ((pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0)   # avg the two floor maps
+            source, color = ("both (3D)" if court_z is not None else "both"), (0, 220, 0)
+            n_both += 1
+        elif pa is not None:                             # side-1 only -> homography floor map
+            court = pa
             source, color, n_a = "side-1", (0, 220, 220), n_a + 1
-        elif court is None and seenB:
-            court = _floor_point(camB, *uvB)
-            # z stays BLANK (single camera -> no real height)
+        elif pb is not None:                             # side-2 only -> homography floor map
+            court = pb
             source, color, n_b = "side-2", (255, 180, 0), n_b + 1
 
         # --- per-frame ball-location log: cam1/cam2 image px + shared court x/y/z (m) ---
@@ -192,8 +199,19 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
         cv2.putText(pA, "SIDE 1", (12, 32), _FONT, 1.0, (255, 255, 255), 2)
         cv2.putText(pB, "SIDE 2", (12, 32), _FONT, 1.0, (255, 255, 255), 2)
 
-        # --- top-down court with the one shared ball ---
+        # --- top-down court with the one shared ball + recent trajectory trail ---
+        trail.append(court)                              # (x, y) m, or None when lost
         mimg = mm._base.copy()
+        # draw the trail (recent positions), breaking the line at lost/off-court frames
+        prev = None
+        for p in trail:
+            if p is not None and mm._on_canvas(p):
+                cur = mm.m2px(p)
+                if prev is not None:
+                    cv2.line(mimg, prev, cur, (0, 165, 255), 2, cv2.LINE_AA)   # orange trail
+                prev = cur
+            else:
+                prev = None                              # break trail across a gap
         if court is not None and mm._on_canvas(court):
             cx, cy = mm.m2px(court)
             cv2.circle(mimg, (cx, cy), 10, color, -1)
