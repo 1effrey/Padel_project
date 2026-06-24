@@ -152,11 +152,11 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
                 source, color, n_both = "both (3D)", (0, 220, 0), n_both + 1
         if court is None and seenA:
             court = _floor_point(camA, *uvA)
-            court_z = 0.0                                # floor back-projection assumes z=0
+            # z stays BLANK: a single camera cannot measure height -- do NOT assume 0.
             source, color, n_a = "side-1", (0, 220, 220), n_a + 1
         elif court is None and seenB:
             court = _floor_point(camB, *uvB)
-            court_z = 0.0
+            # z stays BLANK (single camera -> no real height)
             source, color, n_b = "side-2", (255, 180, 0), n_b + 1
 
         # --- per-frame ball-location log: cam1/cam2 image px + shared court x/y/z (m) ---
