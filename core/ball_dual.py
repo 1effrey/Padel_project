@@ -18,6 +18,7 @@ in one consistent top-down map.
 """
 from __future__ import annotations
 
+import csv
 import os
 from typing import Any, Dict, Optional, Tuple
 
@@ -78,7 +79,7 @@ def _ball_uv(track) -> Optional[Tuple[float, float]]:
 
 def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
                   max_frames: Optional[int] = None, show: bool = False,
-                  save_video: bool = False, yellow_gate: bool = True,
+                  save_video: bool = False, yellow_gate: bool = False,
                   panel_h: int = 540) -> str:
     """Run both cameras synced, side by side, with a shared top-down court showing one
     cross-camera ball. Returns the output video path (or '')."""
@@ -106,6 +107,14 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
 
     writer = None
     out_path = os.path.join(out_dir, "ball_dual.mp4")
+    # per-frame ball-location log (ALWAYS written): each camera's image pixel + the shared
+    # court position x/y (metres) and z (height, real only when both cameras triangulate).
+    csv_path = os.path.join(out_dir, "ball_dual_locations.csv")
+    cf = open(csv_path, "w", newline="")
+    cw = csv.writer(cf)
+    cw.writerow(["frame", "cam1_detected", "cam1_x_px", "cam1_y_px",
+                 "cam2_detected", "cam2_x_px", "cam2_y_px",
+                 "court_x_m", "court_y_m", "court_z_m", "source"])
     if show:
         cv2.namedWindow("Ball Dual (side-1 | side-2 | court)", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Ball Dual (side-1 | side-2 | court)", 1700, 600)
@@ -134,17 +143,33 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
 
         # --- shared court position: triangulate if both, else whichever camera sees it ---
         court = source = color = None
+        court_z = None                                   # height (m); real only when 3D
         if seenA and seenB:
             res = triangulate_ball(camA, camB, uvA, uvB, max_reproj)
             if res is not None:
                 court = (float(res["X"][0]), float(res["X"][1]))
+                court_z = float(res["X"][2])             # triangulated height above floor (m)
                 source, color, n_both = "both (3D)", (0, 220, 0), n_both + 1
         if court is None and seenA:
             court = _floor_point(camA, *uvA)
+            court_z = 0.0                                # floor back-projection assumes z=0
             source, color, n_a = "side-1", (0, 220, 220), n_a + 1
         elif court is None and seenB:
             court = _floor_point(camB, *uvB)
+            court_z = 0.0
             source, color, n_b = "side-2", (255, 180, 0), n_b + 1
+
+        # --- per-frame ball-location log: cam1/cam2 image px + shared court x/y/z (m) ---
+        cw.writerow([
+            n,
+            1 if seenA else 0,
+            f"{uvA[0]:.1f}" if seenA else "", f"{uvA[1]:.1f}" if seenA else "",
+            1 if seenB else 0,
+            f"{uvB[0]:.1f}" if seenB else "", f"{uvB[1]:.1f}" if seenB else "",
+            f"{court[0]:.3f}" if court else "", f"{court[1]:.3f}" if court else "",
+            f"{court_z:.3f}" if court_z is not None else "",
+            source or "lost",
+        ])
 
         # --- court overlay on the full-res frames, THEN scale to panels ---
         if homA is not None:
@@ -195,6 +220,7 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
 
     rA.stop()
     rB.stop()
+    cf.close()
     if writer is not None:
         writer.release()
     if show:
@@ -202,6 +228,7 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     print(f"[ball-dual] {n} frames: ball placed on court via both-cam 3D {n_both}, "
           f"side-1-only {n_a}, side-2-only {n_b} "
           f"(connected {100*(n_both+n_a+n_b)/max(1,n):.0f}% of frames).")
+    print(f"[ball-dual]   locations -> {csv_path}")
     if save_video:
         print(f"[ball-dual]   video -> {out_path}")
     return out_path if save_video else ""

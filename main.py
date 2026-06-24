@@ -348,6 +348,9 @@ def main() -> None:
     parser.add_argument("--ball-dual", action="store_true",
                         help="live side-by-side dual-cam ball view + top-down court with one "
                              "cross-camera ball; needs --config2")
+    parser.add_argument("--yellow-gate", action="store_true",
+                        help="ENABLE the yellow-colour gate in --ball-dual (OFF by default; "
+                             "the low-bitrate ball is usually too washed-out to pass it)")
     parser.add_argument("--sync-manual", action="store_true",
                         help="interactive by-eye sync tuner (nudge the frame offset) -> saves "
                              "to config-A; needs --config2")
@@ -453,7 +456,8 @@ def main() -> None:
         from core.ball_dual import run_dual_view
         config_b = load_config(args.config2)
         run_dual_view(config, config_b, max_frames=args.max_frames,
-                      show=args.show, save_video=args.save_video)
+                      show=args.show, save_video=args.save_video,
+                      yellow_gate=args.yellow_gate)
         return
 
     if args.sync_manual:
