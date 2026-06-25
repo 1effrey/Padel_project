@@ -72,6 +72,7 @@
     },
     "heatmap_threshold": 0.5,
     "min_blob_area": 2,
+    "max_blob_area": 400,
     "method": "tracknet",
     "label_stride": 2,
     "motion": {

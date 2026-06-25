@@ -90,6 +90,7 @@ def _build_detector(config: Dict[str, Any]):
         in_frames=ball.get("in_frames", 3),
         heatmap_threshold=ball.get("heatmap_threshold", 0.5),
         min_blob_area=ball.get("min_blob_area", 2),
+        max_blob_area=ball.get("max_blob_area", 0),
         court_polygon=(court_poly if roi_on else None),
         roi_margin_px=roi_margin,
         crop=ball.get("crop"),                 # court-crop box (or None) -> ball-only

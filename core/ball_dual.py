@@ -171,13 +171,18 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
                 court = (float(res["X"][0]), float(res["X"][1]))    # triangulated x, y (in-bounds)
                 court_z = float(res["X"][2])                        # real triangulated height (m)
                 source, color, n_both = "both (3D)", (0, 220, 0), n_both + 1
+        # NEAR-HALF OWNERSHIP for the live single-camera ball: each camera places only
+        # in/near its OWN half (a 2 m overlap band around the net). A far-court detection
+        # -- a tiny ball OR a far player mistaken for it -- is NOT placed by the wrong
+        # camera; the other camera, which owns that half, handles it.
+        own_margin = 2.0
         if court is None and seenA and homA is not None:
             p = homA.pixel_to_meters(uvA)
-            if -2.0 <= p[0] <= 12.0 and -2.0 <= p[1] <= 22.0:       # on/near court only
+            if -2.0 <= p[0] <= 12.0 and -2.0 <= p[1] <= net_y + own_margin:
                 court, source, color, n_a = p, "side-1", (0, 220, 220), n_a + 1
         if court is None and seenB and homB is not None:
             p = homB.pixel_to_meters(uvB)
-            if -2.0 <= p[0] <= 12.0 and -2.0 <= p[1] <= 22.0:
+            if -2.0 <= p[0] <= 12.0 and net_y - own_margin <= p[1] <= 22.0:
                 court, source, color, n_b = p, "side-2", (255, 180, 0), n_b + 1
 
         # --- bounce events: floor bounces kept only in each camera's OWNED (near) half ---

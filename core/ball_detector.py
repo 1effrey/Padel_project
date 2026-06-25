@@ -252,6 +252,7 @@ class BallDetector:
         in_frames: int = 3,
         heatmap_threshold: float = 0.5,
         min_blob_area: int = 2,
+        max_blob_area: int = 0,
         court_polygon: Optional[Any] = None,
         roi_margin_px: float = 0.0,
         crop: Optional[Dict[str, Any]] = None,
@@ -264,6 +265,9 @@ class BallDetector:
         # empty heatmap cleanly while leaving any sane configured value untouched.
         self.heatmap_threshold = max(float(heatmap_threshold), 1e-6)
         self.min_blob_area = int(min_blob_area)
+        # Reject OVERSIZED heatmap blobs (a bright light / big reflection responds as a
+        # large region; the ball is always a small, tight blob). 0 disables the cap.
+        self.max_blob_area = int(max_blob_area)
         # Optional COURT ROI: reject ball detections outside the court polygon
         # (dilated by roi_margin_px) -> kills background lights / out-of-court blobs.
         # The ball flies above the floor and off the glass, so the margin gives the
@@ -425,8 +429,11 @@ class BallDetector:
         cands: List[Tuple[float, float, float]] = []   # (blob_peak, u, v), in-ROI only
         rejected_by_roi = False
         for lab in range(1, n_labels):
-            if stats[lab, cv2.CC_STAT_AREA] < self.min_blob_area:
+            area = int(stats[lab, cv2.CC_STAT_AREA])
+            if area < self.min_blob_area:
                 continue
+            if self.max_blob_area and area > self.max_blob_area:
+                continue                          # oversized -> a light/reflection, not the ball
             ys, xs = np.where(labels == lab)
             w = heatmap[ys, xs]
             denom = float(np.sum(w))
