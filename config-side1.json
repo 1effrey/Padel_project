@@ -108,7 +108,8 @@
       "hit_angle_deg": 70,
       "hit_min_speed_px_s": 1500,
       "refractory_frames": 3,
-      "in_out_margin_m": 0.1
+      "in_out_margin_m": 0.1,
+      "near_court_margin_m": 1.5
     }
   },
   "reid": {

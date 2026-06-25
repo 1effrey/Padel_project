@@ -173,6 +173,7 @@ def _build_events(config: Dict[str, Any], homography):
         hit_min_speed_px_s=e.get("hit_min_speed_px_s", 1500.0),
         refractory_frames=e.get("refractory_frames", 3),
         in_out_margin_m=e.get("in_out_margin_m", 0.1),
+        near_court_margin_m=e.get("near_court_margin_m", 1.5),
     )
 
 

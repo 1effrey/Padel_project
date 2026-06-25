@@ -78,6 +78,7 @@ class BallEventDetector:
         hit_min_speed_px_s: float = 1500.0,
         refractory_frames: int = 3,
         in_out_margin_m: float = 0.1,
+        near_court_margin_m: float = 1.5,
     ) -> None:
         self.h = homography
         self.min_vy = float(min_vy_px_s)
@@ -87,6 +88,7 @@ class BallEventDetector:
         self.hit_min_speed = float(hit_min_speed_px_s)
         self.refractory = int(refractory_frames)
         self.in_out_margin_m = float(in_out_margin_m)
+        self.near_court_margin_m = float(near_court_margin_m)
         self._reset_runs()
         self._prev_vel: Optional[tuple] = None
         self._prev_measured = False
@@ -136,11 +138,15 @@ class BallEventDetector:
         ev: Optional[BallEvent] = None
         refr_ok = frame - self._last_event_frame >= self.refractory
 
-        # FLOOR BOUNCE: a fast DOWNWARD run (vy>0) then UP (vy<0), ball on the court
+        # FLOOR BOUNCE: a fast DOWNWARD run (vy>0) then UP (vy<0), ball on/near the court.
+        # Accept a bounce landing ON or just OUTSIDE the lines (a real OUT ball) and flag
+        # in/out with the STRICT margin; drop only WILDLY off-court projections (an
+        # airborne ball floor-projects far away -- not a real floor bounce).
         if refr_ok and self._vy_sign > 0 and sy < 0 and self._peak_down_vy >= self.min_vy:
-            inside = (is_inside_court((x_m, y_m), self.in_out_margin_m)
-                      if x_m is not None else None)
-            if x_m is None or inside:
+            if x_m is None:
+                ev = BallEvent(frame, "floor_bounce", u, v, None, None, None)
+            elif is_inside_court((x_m, y_m), self.near_court_margin_m):
+                inside = is_inside_court((x_m, y_m), self.in_out_margin_m)
                 ev = BallEvent(frame, "floor_bounce", u, v, x_m, y_m, inside)
 
         # SIDE-WALL BOUNCE: a fast horizontal run reverses near the x boundary

@@ -226,7 +226,10 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
         cv2.putText(pB, "SIDE 2", (12, 32), _FONT, 1.0, (255, 255, 255), 2)
 
         # --- top-down court with the one shared ball + recent trajectory trail ---
-        trail.append(court)                              # (x, y) m, or None when lost
+        # trail ONLY the RELIABLE (triangulated, both-camera) positions -- single-camera
+        # floor projections jump for an airborne ball, so they are NOT trailed (the ball
+        # DOT below still shows the best-available position every frame).
+        trail.append(court if source == "both (3D)" else None)
         mimg = mm._base.copy()
         # accumulated bounce LANDINGS (persistent diamonds): green = in, red = out
         for bx, by, inc in bounces:
