@@ -102,7 +102,7 @@
     },
     "events": {
       "enabled": true,
-      "min_vy_px_s": 500,
+      "min_vy_px_s": 300,
       "min_vx_px_s": 500,
       "wall_margin_m": 0.6,
       "hit_angle_deg": 70,

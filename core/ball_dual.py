@@ -26,9 +26,9 @@ from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
-from core.ball_eval import _build_detector, _build_tracker
+from core.ball_eval import _build_detector, _build_events, _build_tracker
 from core.camera_calib import build_camera, triangulate_ball
-from utils.homography import Homography, draw_court_lines
+from utils.homography import COURT_LENGTH_M, Homography, draw_court_lines
 from utils.minimap import Minimap
 from utils.video_io import ThreadedVideoReader
 
@@ -106,6 +106,13 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     mm = Minimap(scale_px_per_m=cfg_a.get("minimap", {}).get("scale_px_per_m", 30))
     trail = deque(maxlen=int(cfg_a.get("ball", {}).get("tracker", {}).get("trail_len", 30)))
     max_reproj = float(cfg_a.get("ball", {}).get("fusion", {}).get("max_reproj_px", 40.0))
+    # per-camera bounce detectors. NEAR-HALF OWNERSHIP: each camera places a floor bounce
+    # ONLY in the half nearest it (side-1: y<net_y, side-2: y>=net_y) where its floor
+    # projection is accurate -- the far half is the OTHER camera's job (validated: side-1
+    # fires ~all its bounces in its far half, where localisation is unreliable).
+    evA, evB = _build_events(cfg_a, homA), _build_events(cfg_b, homB)
+    net_y = COURT_LENGTH_M / 2.0
+    bounces = []                                     # accumulated landing-map points (x, y, in)
 
     writer = None
     out_path = os.path.join(out_dir, "ball_dual.mp4")
@@ -117,6 +124,12 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     cw.writerow(["frame", "cam1_detected", "cam1_x_px", "cam1_y_px",
                  "cam2_detected", "cam2_x_px", "cam2_y_px",
                  "court_x_m", "court_y_m", "court_z_m", "source"])
+    # accurate bounce/landing log -- floor bounces only, each from the camera that owns
+    # that half (so the court x/y is the trustworthy ground-contact position).
+    bcsv_path = os.path.join(out_dir, "ball_dual_bounces.csv")
+    bf = open(bcsv_path, "w", newline="")
+    bw = csv.writer(bf)
+    bw.writerow(["frame", "camera", "court_x_m", "court_y_m", "in_court"])
     if show:
         cv2.namedWindow("Ball Dual (side-1 | side-2 | court)", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Ball Dual (side-1 | side-2 | court)", 1700, 600)
@@ -167,6 +180,18 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
             if -2.0 <= p[0] <= 12.0 and -2.0 <= p[1] <= 22.0:
                 court, source, color, n_b = p, "side-2", (255, 180, 0), n_b + 1
 
+        # --- bounce events: floor bounces kept only in each camera's OWNED (near) half ---
+        eA = evA.update(n, tA) if evA is not None else None
+        eB = evB.update(n, tB) if evB is not None else None
+        for ev, cam_name in ((eA, "side-1"), (eB, "side-2")):
+            if ev is None or ev.type != "floor_bounce" or ev.x_m is None:
+                continue
+            owns = (ev.y_m < net_y) if cam_name == "side-1" else (ev.y_m >= net_y)
+            if owns:
+                bounces.append((ev.x_m, ev.y_m, ev.in_court))
+                bw.writerow([n, cam_name, f"{ev.x_m:.3f}", f"{ev.y_m:.3f}",
+                             "" if ev.in_court is None else int(ev.in_court)])
+
         # --- per-frame ball-location log: cam1/cam2 image px + shared court x/y/z (m) ---
         cw.writerow([
             n,
@@ -203,6 +228,12 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
         # --- top-down court with the one shared ball + recent trajectory trail ---
         trail.append(court)                              # (x, y) m, or None when lost
         mimg = mm._base.copy()
+        # accumulated bounce LANDINGS (persistent diamonds): green = in, red = out
+        for bx, by, inc in bounces:
+            if mm._on_canvas((bx, by)):
+                bpx, bpy = mm.m2px((bx, by))
+                bcol = (0, 0, 255) if inc is False else (0, 220, 0)
+                cv2.drawMarker(mimg, (bpx, bpy), bcol, cv2.MARKER_DIAMOND, 12, 2)
         # draw the trail (recent positions), breaking the line at lost/off-court frames
         prev = None
         for p in trail:
@@ -240,6 +271,7 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     rA.stop()
     rB.stop()
     cf.close()
+    bf.close()
     if writer is not None:
         writer.release()
     if show:
@@ -248,6 +280,7 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
           f"side-1-only {n_a}, side-2-only {n_b} "
           f"(connected {100*(n_both+n_a+n_b)/max(1,n):.0f}% of frames).")
     print(f"[ball-dual]   locations -> {csv_path}")
+    print(f"[ball-dual]   bounces   -> {bcsv_path} ({len(bounces)} near-half landings)")
     if save_video:
         print(f"[ball-dual]   video -> {out_path}")
     return out_path if save_video else ""
