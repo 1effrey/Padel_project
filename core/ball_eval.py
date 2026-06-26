@@ -189,6 +189,8 @@ def _build_events(config: Dict[str, Any], homography, detect_bounces: Optional[b
         player_speed_drop=e.get("player_speed_drop", 0.5),
         player_drive_ratio=e.get("player_drive_ratio", 3.0),
         player_cooldown_frames=e.get("player_cooldown_frames", 10),
+        player_contact_px=e.get("player_contact_px", 90.0),
+        player_pass_frames=e.get("player_pass_frames", 4),
         net_polygon=config.get("court", {}).get("net_polygon"),
         net_min_speed_px_s=e.get("net_min_speed_px_s", 600.0),
         net_speed_drop=e.get("net_speed_drop", 0.45),
@@ -198,6 +200,7 @@ def _build_events(config: Dict[str, Any], homography, detect_bounces: Optional[b
         in_out_margin_m=e.get("in_out_margin_m", 0.1),
         detect_bounces=detect_bounces,
         glass_regions=config.get("court", {}).get("walls"),
+        fence_regions=config.get("court", {}).get("fence"),
     )
 
 

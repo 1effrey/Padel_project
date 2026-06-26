@@ -49,7 +49,7 @@ import numpy as np
 
 # Events that BREAK a free-flight arc: at each, the ball's velocity changes
 # discontinuously, so a single parabola cannot span across them.
-_BREAKING_EVENTS = ("floor_bounce", "wall_bounce", "hit")
+_BREAKING_EVENTS = ("floor_bounce", "wall_bounce", "fence_hit", "hit")
 
 
 @dataclass

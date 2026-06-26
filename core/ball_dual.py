@@ -38,6 +38,20 @@ _YELLOW_LO = np.array([22, 50, 50], dtype=np.uint8)
 _YELLOW_HI = np.array([45, 255, 255], dtype=np.uint8)
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
+# hit-marker colours (BGR) + on-screen labels, by event type.
+_HIT_COLORS = {
+    "player_hit": (255, 0, 255),    # magenta
+    "net_hit": (255, 255, 0),       # cyan
+    "wall_bounce": (0, 165, 255),   # orange  -> WALL (in play)
+    "fence_hit": (0, 0, 255),       # red     -> FENCE = OUT
+}
+_HIT_LABELS = {
+    "player_hit": "player hit",
+    "net_hit": "net hit",
+    "wall_bounce": "wall hit",
+    "fence_hit": "fence OUT",
+}
+
 
 def _is_yellow(frame: np.ndarray, u: float, v: float, r: int = 12,
                frac: float = 0.06) -> bool:
@@ -78,6 +92,31 @@ def _ball_uv(track) -> Optional[Tuple[float, float]]:
     return None
 
 
+def _draw_ball_trail(panel: np.ndarray, trail, scale: float,
+                     color: Tuple[int, int, int] = (0, 255, 255)) -> None:
+    """Draw the ball's recent path as a fading, tapering tail on a SCALED panel, with a
+    bright head dot at the newest point -- easier to follow than a static marker.
+
+    PURELY visual: it just reads a deque of full-res (u, v) ball pixels (None entries
+    are frames the ball was not seen and BREAK the line). Detection/tracking untouched.
+    Older segments are drawn thinner so the tail visibly fades toward the past."""
+    pts = list(trail)
+    n = len(pts)
+    prev = None
+    for i, p in enumerate(pts):
+        if p is None:                                  # gap -> break the line here
+            prev = None
+            continue
+        cur = (int(p[0] * scale), int(p[1] * scale))
+        if prev is not None:
+            thick = max(1, int(1 + 4 * (i / max(1, n - 1))))   # taper: old=thin, new=thick
+            cv2.line(panel, prev, cur, color, thick, cv2.LINE_AA)
+        prev = cur
+    if prev is not None:                               # head dot on the current ball
+        cv2.circle(panel, prev, 7, color, -1)
+        cv2.circle(panel, prev, 7, (255, 255, 255), 1)
+
+
 def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
                   max_frames: Optional[int] = None, show: bool = False,
                   save_video: bool = False, yellow_gate: bool = False,
@@ -104,7 +143,11 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     trkA, _ = _build_tracker(cfg_a, fps)
     trkB, _ = _build_tracker(cfg_b, fps)
     mm = Minimap(scale_px_per_m=cfg_a.get("minimap", {}).get("scale_px_per_m", 30))
-    trail = deque(maxlen=int(cfg_a.get("ball", {}).get("tracker", {}).get("trail_len", 30)))
+    _trail_len = int(cfg_a.get("ball", {}).get("tracker", {}).get("trail_len", 30))
+    trail = deque(maxlen=_trail_len)
+    # per-camera 2D pixel trails (full-res ball (u,v), None = not seen) -> the on-panel
+    # ball tail. Purely visual; same length as the court trail.
+    ball_trailA, ball_trailB = deque(maxlen=_trail_len), deque(maxlen=_trail_len)
     max_reproj = float(cfg_a.get("ball", {}).get("fusion", {}).get("max_reproj_px", 40.0))
     # per-camera bounce detectors. NEAR-HALF OWNERSHIP: each camera places a floor bounce
     # ONLY in the half nearest it (side-1: y<net_y, side-2: y>=net_y) where its floor
@@ -128,11 +171,13 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
                             imgsz=dc.get("imgsz", 1280))
     kp_conf = cfg_a.get("skeleton", {}).get("keypoint_conf_threshold", 0.5)
 
-    # HIT accumulators (player_hit / net_hit): drawn on the panels, tallied, and logged.
-    # De-dup is across BOTH cameras -- one real hit can be seen by both -> count it ONCE.
-    hit_counts = {"player_hit": 0, "net_hit": 0}
+    # HIT accumulators: drawn on the panels, tallied, and logged. De-dup is across BOTH
+    # cameras -- one real hit can be seen by both -> count it ONCE. wall_bounce = a glass /
+    # off-floor deflection (in play); fence_hit = a metal-fence deflection (OUT).
+    _HIT_TYPES = ("player_hit", "net_hit", "wall_bounce", "fence_hit")
+    hit_counts = {t: 0 for t in _HIT_TYPES}
     recentA, recentB = deque(maxlen=60), deque(maxlen=60)
-    last_hit_frame = {"player_hit": -10 ** 9, "net_hit": -10 ** 9}
+    last_hit_frame = {t: -10 ** 9 for t in _HIT_TYPES}
     hit_dedup = int(cfg_a.get("ball", {}).get("fusion", {}).get("hit_dedup_frames", 5))
     hcsv_path = os.path.join(out_dir, "ball_dual_hits.csv")
     hcf = open(hcsv_path, "w", newline="")
@@ -223,10 +268,10 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
                 bw.writerow([n, cam_name, f"{ev.x_m:.3f}", f"{ev.y_m:.3f}",
                              "" if ev.in_court is None else int(ev.in_court)])
 
-        # --- PLAYER / NET hits: counted ONCE across both cameras (a hit one camera sees,
-        #     the other often sees too). The firing camera's panel shows the marker. ---
+        # --- PLAYER / NET / WALL / FENCE hits: counted ONCE across both cameras (a hit one
+        #     camera sees, the other often sees too). The firing camera's panel shows it. ---
         for ev, cam_name, recent in ((eA, "side-1", recentA), (eB, "side-2", recentB)):
-            if ev is None or ev.type not in ("player_hit", "net_hit"):
+            if ev is None or ev.type not in _HIT_TYPES:
                 continue
             if n - last_hit_frame[ev.type] < hit_dedup:
                 continue                              # duplicate of the other camera's hit
@@ -255,31 +300,28 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
             draw_court_lines(fB, homB, thickness=2)
         pA, pB = fit(fA), fit(fB)
         sA, sB = panel_h / fA.shape[0], panel_h / fB.shape[0]
-        # ball drawn on the SCALED panels (with a crosshair) so it stays clearly visible
-        if seenA:
-            ca = (int(uvA[0] * sA), int(uvA[1] * sA))
-            cv2.circle(pA, ca, 13, (255, 0, 255), 3)
-            cv2.line(pA, (ca[0] - 22, ca[1]), (ca[0] + 22, ca[1]), (255, 0, 255), 1)
-            cv2.line(pA, (ca[0], ca[1] - 22), (ca[0], ca[1] + 22), (255, 0, 255), 1)
-        if seenB:
-            cb = (int(uvB[0] * sB), int(uvB[1] * sB))
-            cv2.circle(pB, cb, 13, (255, 0, 255), 3)
-            cv2.line(pB, (cb[0] - 22, cb[1]), (cb[0] + 22, cb[1]), (255, 0, 255), 1)
-            cv2.line(pB, (cb[0], cb[1] - 22), (cb[0], cb[1] + 22), (255, 0, 255), 1)
+        # ball shown as a FADING TRAIL on each panel (newest = bright head dot) instead of
+        # a static crosshair, so the moving ball is easy to follow. Visual only -- the
+        # underlying detection/tracking is unchanged; we only record where it was seen.
+        ball_trailA.append((uvA[0], uvA[1]) if seenA else None)
+        ball_trailB.append((uvB[0], uvB[1]) if seenB else None)
+        _draw_ball_trail(pA, ball_trailA, sA)
+        _draw_ball_trail(pB, ball_trailB, sB)
         cv2.putText(pA, "SIDE 1", (12, 32), _FONT, 1.0, (255, 255, 255), 2)
         cv2.putText(pB, "SIDE 2", (12, 32), _FONT, 1.0, (255, 255, 255), 2)
 
-        # recent PLAYER (magenta) / NET (cyan) hit markers on each panel, kept ~1 s
+        # recent hit markers on each panel, kept ~1 s. PLAYER=magenta, NET=cyan,
+        # WALL=orange (in play), FENCE=red (OUT).
         for recent, panel, scale in ((recentA, pA, sA), (recentB, pB, sB)):
             for fno, ev in recent:
                 age = n - fno
                 if age > 20:
                     continue
-                hcol = (255, 0, 255) if ev.type == "player_hit" else (255, 255, 0)
+                hcol = _HIT_COLORS.get(ev.type, (255, 255, 255))
                 hx, hy = int(ev.u * scale), int(ev.v * scale)
                 cv2.drawMarker(panel, (hx, hy), hcol, cv2.MARKER_DIAMOND, 26, 3)
                 if age <= 7:
-                    cv2.putText(panel, ev.type.replace("_", " ").upper(), (hx + 14, hy),
+                    cv2.putText(panel, _HIT_LABELS.get(ev.type, ev.type).upper(), (hx + 14, hy),
                                 _FONT, 0.6, hcol, 2)
 
         # --- top-down court with the one shared ball + recent trajectory trail ---
@@ -316,9 +358,11 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
 
         # running tally (top-right of the composite): hits + accumulated landings
         for i, (lab, val, hcol) in enumerate(
-                (("PLAYER HITS", hit_counts["player_hit"], (255, 0, 255)),
-                 ("NET HITS", hit_counts["net_hit"], (255, 255, 0)),
-                 ("BOUNCES", len(bounces), (0, 165, 255)))):
+                (("PLAYER HITS", hit_counts["player_hit"], _HIT_COLORS["player_hit"]),
+                 ("NET HITS", hit_counts["net_hit"], _HIT_COLORS["net_hit"]),
+                 ("WALL HITS", hit_counts["wall_bounce"], _HIT_COLORS["wall_bounce"]),
+                 ("FENCE OUT", hit_counts["fence_hit"], _HIT_COLORS["fence_hit"]),
+                 ("BOUNCES", len(bounces), (0, 220, 0)))):
             txt = f"{lab}: {val}"
             (tw, _t), _bl = cv2.getTextSize(txt, _FONT, 0.8, 2)
             tx, ty = comp.shape[1] - tw - 16, 34 + i * 34
@@ -354,7 +398,8 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     print(f"[ball-dual]   locations -> {csv_path}")
     print(f"[ball-dual]   bounces   -> {bcsv_path} ({len(bounces)} near-half landings)")
     print(f"[ball-dual]   hits      -> {hcsv_path} "
-          f"({hit_counts['player_hit']} player, {hit_counts['net_hit']} net)")
+          f"({hit_counts['player_hit']} player, {hit_counts['net_hit']} net, "
+          f"{hit_counts['wall_bounce']} wall, {hit_counts['fence_hit']} fence-OUT)")
     if save_video:
         print(f"[ball-dual]   video -> {out_path}")
     return out_path if save_video else ""

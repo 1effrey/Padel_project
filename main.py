@@ -363,6 +363,12 @@ def main() -> None:
     parser.add_argument("--precision", action="store_true",
                         help="score the detector against the labeled frames (real precision) and exit")
     parser.add_argument("--calibrate-roi", action="store_true", help="define the court polygon and exit")
+    parser.add_argument("--calibrate-walls", action="store_true",
+                        help="mark the GLASS wall regions on --config's camera and exit")
+    parser.add_argument("--calibrate-fence", action="store_true",
+                        help="mark the METAL fence regions (LEFT + RIGHT = OUT) and exit")
+    parser.add_argument("--calibrate-net", action="store_true",
+                        help="mark the NET perimeter polygon on --config's camera and exit")
     parser.add_argument("--calibrate-homography", action="store_true", help="define the pixel<->meters homography and exit")
     parser.add_argument("--verify-homography", action="store_true", help="redraw the saved homography overlay and exit")
     args = parser.parse_args()
@@ -399,6 +405,21 @@ def main() -> None:
 
     if args.calibrate_roi:
         calibrate_roi(config, args.config)
+        return
+
+    if args.calibrate_walls:
+        from core.calibrate_boundaries import calibrate_walls
+        calibrate_walls(config, args.config)
+        return
+
+    if args.calibrate_fence:
+        from core.calibrate_boundaries import calibrate_fence
+        calibrate_fence(config, args.config)
+        return
+
+    if args.calibrate_net:
+        from core.calibrate_boundaries import calibrate_net
+        calibrate_net(config, args.config)
         return
 
     if args.calibrate_homography:

@@ -68,7 +68,7 @@ class BallEvent:
     is available (and, for in/out, only for floor bounces which sit on the floor)."""
 
     frame: int
-    type: str                       # "floor_bounce"|"wall_bounce"|"hit"|"player_hit"|"net_hit"
+    type: str                       # "floor_bounce"|"wall_bounce"|"fence_hit"|"hit"|"player_hit"|"net_hit"
     u: float                        # image pixel of the event
     v: float
     x_m: Optional[float] = None     # court metres (floor-accurate at a bounce)
@@ -113,6 +113,8 @@ class BallEventDetector:
         player_speed_drop: float = 0.5,
         player_drive_ratio: float = 3.0,
         player_cooldown_frames: int = 10,
+        player_contact_px: float = 90.0,
+        player_pass_frames: int = 4,
         net_polygon: Optional[List] = None,
         net_min_speed_px_s: float = 600.0,
         net_speed_drop: float = 0.45,
@@ -122,6 +124,7 @@ class BallEventDetector:
         in_out_margin_m: float = 0.1,
         detect_bounces: bool = True,
         glass_regions=None,
+        fence_regions=None,
     ) -> None:
         self.h = homography
         self.min_vy = float(min_vy_px_s)
@@ -137,6 +140,13 @@ class BallEventDetector:
         self.player_speed_drop = float(player_speed_drop)
         self.player_drive_ratio = float(player_drive_ratio)
         self.player_cooldown = int(player_cooldown_frames)
+        # STRICT player-hit rule:
+        #   player_contact_px ... TINY radius around the racket-holding wrist; the ball must
+        #                         be this close to count as a contact (no large "reach zone").
+        #   player_pass_frames .. how many frames after the contact we wait for a deflection
+        #                         before declaring a pass-through (a MISS).
+        self.player_contact_px = float(player_contact_px)
+        self.player_pass_frames = int(player_pass_frames)
         # net region in IMAGE pixels (a calibrated polygon); used to gate net hits.
         self._net_poly = (np.array(net_polygon, dtype=np.int32).reshape(-1, 1, 2)
                           if net_polygon else None)
@@ -149,23 +159,25 @@ class BallEventDetector:
         # when False, floor_bounce / wall_bounce are NOT emitted -- use this when another
         # part of the pipeline already owns bounce detection (we still emit player/net hits).
         self.detect_bounces = bool(detect_bounces)
-        # drawn image-space glass/wall polygons (full-res coords), for wall-hit gating
+        # drawn image-space GLASS wall polygons (full-res coords) -> a deflection here is a
+        # WALL hit (the ball stays in play).
         self._glass = [list(map(list, poly)) for poly in (glass_regions or [])]
+        # drawn image-space METAL FENCE polygons -> a deflection here is a FENCE hit = OUT.
+        self._fence = [list(map(list, poly)) for poly in (fence_regions or [])]
         self._reset_runs()
         self._prev_vel: Optional[tuple] = None
         self._prev_measured = False
         self._last_event_frame = -10 ** 9
         self._net_peak = 0.0          # peak speed during the current net-band visit
         self._net_fired = False       # one net event per net-band visit
-        self._rk_peak = 0.0           # racket zone: peak/min speed, entry dir, min point
-        self._rk_min = 0.0
-        self._rk_prev = 0.0
-        self._rk_entry: Optional[tuple] = None
-        self._rk_min_uv = (0.0, 0.0)
-        self._rk_min_frame = 0
-        self._rk_near = False
-        self._rk_fired = False        # one player hit per racket-zone visit
-        self._last_player_frame = -10 ** 9   # cooldown between consecutive player hits
+        # pending-contact state for the STRICT player-hit rule (see _update_player_hit)
+        self._pc_active = False       # a wrist contact is being evaluated for a deflection
+        self._pc_frame = 0            # frame the ball first touched the wrist
+        self._pc_uv = (0.0, 0.0)      # contact point (where the marker goes)
+        self._pc_hand: Optional[str] = None   # which wrist (the racket-holding one)
+        self._pc_vel_in: Optional[tuple] = None   # incoming (approach) velocity vector
+        self._pc_age = 0              # frames elapsed since the contact began
+        self._player_lock_until = -10 ** 9   # no new player hit before this frame (10-frame lock)
 
     def _reset_runs(self) -> None:
         self._vy_sign = 0
@@ -179,33 +191,114 @@ class BallEventDetector:
         self._prev_measured = False
         self._net_peak = 0.0
         self._net_fired = False
-        self._rk_peak = self._rk_min = self._rk_prev = 0.0
-        self._rk_entry = None
-        self._rk_min_uv = (0.0, 0.0)
-        self._rk_min_frame = 0
-        self._rk_near = self._rk_fired = False
-        self._last_player_frame = -10 ** 9
+        self._pc_active = False
+        self._pc_frame = 0
+        self._pc_uv = (0.0, 0.0)
+        self._pc_hand = None
+        self._pc_vel_in = None
+        self._pc_age = 0
+        self._player_lock_until = -10 ** 9
 
-    def _nearest_wrist(self, u: float, v: float, wrists) -> Optional[str]:
-        """Hand label of the nearest wrist IF the ball sits at RACKET-HEAD distance from it
-        (racket_min .. racket_reach). A ball IN the hand (< racket_min, e.g. a bare-hand
-        grab off the ground) or too far (> racket_reach) returns None -- so only the
-        racket-holding hand, meeting the ball at the racket head, counts as a contact.
+    def _nearest_wrist_dist(self, u: float, v: float, wrists):
+        """(distance, hand) of the wrist NEAREST the ball this frame, or (inf, None).
+
+        ISOLATING THE RACKET-HOLDING ARM: we have no racket detector, so we take the wrist
+        the ball actually CONTACTS (the nearest one) as the racket-holding arm -- a ball only
+        deflects where the racket meets it. The OTHER (non-dominant) arm's wrist is simply
+        never the nearest at a real contact, so it is ignored by construction.
         `wrists` is this frame's wrist points as (u, v) or (u, v, hand)."""
         if not wrists:
-            return None
+            return 1e18, None
         best_d, best = 1e18, None
         for w in wrists:
             d = math.hypot(u - float(w[0]), v - float(w[1]))
             if d < best_d:
                 best_d, best = d, w
-        if best is None or not (self.racket_min <= best_d <= self.racket_reach):
-            return None                      # in-hand grab (too close) or too far -> not a contact
-        return str(best[2]) if len(best) > 2 else ""
+        hand = (str(best[2]) if best is not None and len(best) > 2 else "")
+        return best_d, (hand if best is not None else None)
+
+    @staticmethod
+    def _deflected(vel_in, vx: float, vy: float, cos_turn: float) -> bool:
+        """True if the trajectory vector TURNED more than the threshold between the incoming
+        (approach) velocity `vel_in` and the current velocity (vx, vy).
+
+        We compare the two vectors by the cosine of the angle between them:
+            cos(angle) = (a . b) / (|a| |b|)
+        cos ~ +1 -> same heading (the ball passed straight through -> NOT a hit),
+        cos < cos_turn -> it bent more than `player_turn_deg` (a real deflection -> a hit).
+        A sign flip in DX or DY (e.g. vx: +1500 -> -1500) drives cos negative, so this one
+        test captures both 'reversed X' and 'reversed Y' as well as any sharp redirect.
+        A ball that merely STOPS (current speed ~ 0) gives no direction -> not a deflection
+        (so a bare-hand grab / catch is not mistaken for a racket hit)."""
+        if vel_in is None:
+            return False
+        pvx, pvy = vel_in
+        ps = math.hypot(pvx, pvy)
+        cs = math.hypot(vx, vy)
+        if ps <= 1e-6 or cs <= 1e-6:
+            return False
+        cosang = (pvx * vx + pvy * vy) / (ps * cs)
+        return cosang < cos_turn
+
+    def _update_player_hit(self, frame: int, u: float, v: float, vx: float, vy: float,
+                           prev_vel, wrists) -> Optional[BallEvent]:
+        """STRICT player-hit detection -- the three rules, in order:
+
+        1) PROXIMAL DETECTION  -- the ball must be within player_contact_px of the racket-
+           holding wrist (the nearest wrist). A larger 'reach' is deliberately NOT used, so
+           the hit cannot fire while the ball is merely approaching the player.
+        2) DEFLECTION VALIDATION -- proximity alone is NOT enough. We remember the incoming
+           velocity when the ball first touches the wrist, then on the following frame(s)
+           check whether the trajectory actually bent (see _deflected). A ball that passes
+           through the wrist with its DX/DY heading unchanged is a MISS.
+        3) NO DOUBLE-HITS -- once a deflection registers, we LOCK player hits for
+           player_cooldown frames so a single swing cannot fire several times.
+
+        Returns a player_hit BallEvent (pinned to the CONTACT point/frame, so the marker
+        lands exactly where the ball met the racket) or None.
+        """
+        # rule 3: still inside the post-hit lock window -> emit nothing.
+        if frame < self._player_lock_until:
+            return None
+
+        d, hand = self._nearest_wrist_dist(u, v, wrists)
+        near = hand is not None and d <= self.player_contact_px
+
+        # rule 1: open a pending contact the first frame the ball touches the wrist,
+        # recording the INCOMING velocity (the approach) to compare against later.
+        if not self._pc_active:
+            if not near:
+                return None
+            self._pc_active = True
+            self._pc_frame = frame
+            self._pc_uv = (u, v)
+            self._pc_hand = hand
+            self._pc_vel_in = prev_vel
+            self._pc_age = 0
+        else:
+            self._pc_age += 1
+
+        # rule 2: did the trajectory bend right after contact? -> a real hit.
+        if self._deflected(self._pc_vel_in, vx, vy, self.player_cos_turn):
+            ev = BallEvent(self._pc_frame, "player_hit", self._pc_uv[0], self._pc_uv[1],
+                           None, None, None, player_hand=self._pc_hand)
+            self._player_lock_until = frame + self.player_cooldown   # rule 3: lock the swing
+            self._pc_active = False
+            return ev
+
+        # no deflection yet: if the ball has LEFT the wrist or we have waited long enough,
+        # it passed through -> a MISS; drop the pending contact.
+        if (not near) or self._pc_age >= self.player_pass_frames:
+            self._pc_active = False
+        return None
 
     def _in_glass(self, u: float, v: float) -> bool:
-        """True if (u, v) falls inside any drawn glass/wall region."""
+        """True if (u, v) falls inside any drawn GLASS wall region (in-play surface)."""
         return any(_point_in_poly(u, v, poly) for poly in self._glass)
+
+    def _in_fence(self, u: float, v: float) -> bool:
+        """True if (u, v) falls inside any drawn METAL FENCE region (a hit here = OUT)."""
+        return any(_point_in_poly(u, v, poly) for poly in self._fence)
 
     def _in_net(self, u: float, v: float) -> bool:
         """True if (u, v) is inside the calibrated NET region, or within net_margin_px of
@@ -265,98 +358,62 @@ class BallEventDetector:
             self._net_peak = 0.0
             self._net_fired = False
 
-        # PLAYER hit -- ONE event per racket-zone visit, PINNED TO THE DEFLECTION POINT
-        # (the contact: where the ball's speed bottoms out / its direction flips at the
-        # racket). The racket is ~0.45 m past the wrist and SWINGS, so racket_reach is a
-        # generous zone around the wrist. While the ball stays in the zone we track its
-        # PEAK speed, its ENTRY direction, and the running speed MINIMUM (with its u,v).
-        # We fire ONCE -- not every frame -- when the racket has clearly acted: the ball
-        # REVERSED direction, or it slowed to the contact and is now LEAVING (rising), or
-        # it was DRIVEN up from a low -- and we report the event AT that minimum point.
-        hand = self._nearest_wrist(u, v, wrists)
-        near_wrist = hand is not None
-        player_hit = None                              # (frame, u, v, hand) when confirmed
-        if near_wrist and not self._rk_near:           # ENTERED the racket zone
-            self._rk_peak = self._rk_min = self._rk_prev = speed
-            self._rk_entry = (vx / speed, vy / speed) if speed > 0 else None
-            self._rk_min_uv = (u, v)
-            self._rk_min_frame = frame
-            self._rk_fired = False
-        elif near_wrist:                               # still in the zone
-            if speed > self._rk_peak:
-                self._rk_peak = speed
-                if speed > 0:
-                    self._rk_entry = (vx / speed, vy / speed)
-            if speed < self._rk_min:
-                self._rk_min = speed
-                self._rk_min_uv = (u, v)
-                self._rk_min_frame = frame
-            if not self._rk_fired and self._rk_peak >= self.player_min_speed:
-                rising = speed > self._rk_prev + 1.0
-                came_down = self._rk_min <= self.player_speed_drop * self._rk_peak
-                redirected = (speed > 0 and self._rk_entry is not None
-                              and (self._rk_entry[0] * vx + self._rk_entry[1] * vy) / speed
-                              < self.player_cos_turn)
-                drove = (self._rk_min > 0 and speed >= self.player_min_speed
-                         and speed >= self.player_drive_ratio * self._rk_min)
-                if ((redirected or (rising and came_down) or drove)
-                        and frame - self._last_player_frame >= self.player_cooldown):
-                    mu, mv = self._rk_min_uv
-                    player_hit = (self._rk_min_frame, mu, mv, hand)
-                    self._rk_fired = True
-                    self._last_player_frame = frame
-            self._rk_prev = speed
-        else:                                          # left the zone -> reset
-            self._rk_peak = self._rk_min = self._rk_prev = 0.0
-            self._rk_entry = None
-            self._rk_fired = False
-        self._rk_near = near_wrist
+        # PLAYER HIT (strict rule): tiny wrist proximity + a real post-contact deflection,
+        # locked for a few frames after firing. Evaluated EVERY frame by its own helper so
+        # the contact/deflection state is tracked cleanly. See _update_player_hit.
+        player_ev = self._update_player_hit(frame, u, v, vx, vy, prev_vel, wrists)
 
-        if in_net:
-            # IN THE NET BAND only a real CONTACT fires (floor/wall/generic-hit suppressed
-            # -- the homography is unreliable and balls just pass over). The ball must have
-            # come in FAST (peak), then either DEFLECT (changed direction AND slowed) or
-            # STOP (slowed to a fraction of its in-net peak, even gradually). A player
-            # VOLLEY (near a wrist) is a player_hit. A smooth pass-over keeps its speed and
-            # leaves the band -> nothing.
+        # A confirmed PLAYER HIT wins over everything else (a volley at the net is a player
+        # hit, not a net hit). Otherwise fall through to the net / floor / wall logic.
+        if player_ev is not None and refr_ok:
+            ev = player_ev
+        elif in_net:
+            # IN THE NET BAND only a real CONTACT fires (floor/wall suppressed -- the
+            # homography is unreliable and balls just pass over). The ball must have come in
+            # FAST (peak), then either DEFLECT (changed direction AND slowed) or STOP (slowed
+            # to a fraction of its in-net peak, even gradually). A smooth pass-over keeps its
+            # speed and leaves the band -> nothing.
             came_fast = self._net_peak >= self.net_min_speed
             net_deflect = came_fast and cosang < self.net_cos_turn and speed < pspeed
             net_stop = came_fast and speed <= self.net_speed_drop * self._net_peak
-            if refr_ok and not self._net_fired and player_hit is not None:
-                pf, pu, pv, ph = player_hit
-                ev = BallEvent(pf, "player_hit", pu, pv, None, None, None, player_hand=ph)
-                self._net_fired = True
-            elif refr_ok and not self._net_fired and (net_deflect or net_stop):
+            if refr_ok and not self._net_fired and (net_deflect or net_stop):
                 ev = BallEvent(frame, "net_hit", u, v, x_m, y_m, None,
                                speed_change=speed - pspeed)
                 self._net_fired = True
         else:
-            # FLOOR BOUNCE: a fast DOWNWARD run (vy>0) then UP (vy<0), ball on the court
-            if (self.detect_bounces and refr_ok and self._vy_sign > 0 and sy < 0
-                    and self._peak_down_vy >= self.min_vy):
-                inside = (is_inside_court((x_m, y_m), self.in_out_margin_m)
-                          if x_m is not None else None)
-                if x_m is None or inside:
-                    ev = BallEvent(frame, "floor_bounce", u, v, x_m, y_m, inside)
+            # CLASSIFY A DEFLECTION BY WHERE IT HAPPENS (player hits were handled above, so
+            # anything here is FAR FROM A HAND). A "deflection" is a sharp change of heading
+            # between consecutive measured frames -- read from the robust per-axis "fast run
+            # then reverse" signals, plus a general sharp-turn for off-axis (e.g. back-wall)
+            # reversals.
+            vert_rev = (self._vy_sign > 0 and sy < 0 and self._peak_down_vy >= self.min_vy)
+            horiz_rev = (sx != 0 and self._vx_sign != 0 and sx != self._vx_sign
+                         and self._peak_vx >= self.min_vx)
+            sharp_turn = (pspeed >= self.min_vx and speed >= 0.3 * pspeed
+                          and cosang < self.cos_hit)
+            deflect = vert_rev or horiz_rev or sharp_turn
 
-            # SIDE-WALL BOUNCE: a fast horizontal run reverses AT the glass. Prefer the
-            # drawn image-space glass region (parallax-free for an airborne ball); fall
-            # back to the homography side-boundary when no regions are drawn.
-            if (ev is None and self.detect_bounces and refr_ok and sx != 0
-                    and self._vx_sign != 0 and sx != self._vx_sign
-                    and self._peak_vx >= self.min_vx):
-                near_boundary = (x_m is not None and 0.0 <= y_m <= COURT_LENGTH_M
-                                 and (x_m < self.wall_margin_m
-                                      or x_m > COURT_WIDTH_M - self.wall_margin_m))
-                if self._in_glass(u, v) or near_boundary:
+            # is the contact ON the court floor? (the homography maps a floor point in-bounds;
+            # a ball up on the glass/fence projects OUTSIDE the court). None = no homography.
+            inside = (is_inside_court((x_m, y_m), self.in_out_margin_m)
+                      if x_m is not None else None)
+
+            if self.detect_bounces and refr_ok and deflect:
+                if self._in_fence(u, v):
+                    # deflected into the metal fence -> OUT (the round ends). in_court=False.
+                    ev = BallEvent(frame, "fence_hit", u, v, x_m, y_m, in_court=False)
+                elif self._in_glass(u, v):
+                    # deflected in a marked GLASS panel -> WALL hit (ball stays in play).
                     ev = BallEvent(frame, "wall_bounce", u, v, x_m, y_m, None)
-
-            # PLAYER HIT: the racket acted on the ball (one per visit, at the deflection
-            # point computed above). A change with NO racket nearby is dropped -- a ball
-            # only deflects at a player / net / wall / floor; a mid-air "hit" is noise.
-            if ev is None and refr_ok and player_hit is not None:
-                pf, pu, pv, ph = player_hit
-                ev = BallEvent(pf, "player_hit", pu, pv, None, None, None, player_hand=ph)
+                elif inside is False:
+                    # a deflection OUTSIDE the court floor, far from any hand: it bounced off
+                    # something off the floor -> treat as a WALL hit even with no drawn region.
+                    ev = BallEvent(frame, "wall_bounce", u, v, x_m, y_m, None)
+                elif vert_rev and (inside is None or inside):
+                    # a falling ball bounced UP while ON the court floor -> floor bounce
+                    # (the in/out call comes from the court lines).
+                    ev = BallEvent(frame, "floor_bounce", u, v, x_m, y_m, inside)
+                # else: a deflection INSIDE the court that is not a floor bounce -> noise.
 
         # advance run state; reset a run's peak when its sign flips
         if sy != 0 and sy != self._vy_sign:
@@ -397,24 +454,30 @@ if __name__ == "__main__":  # synthetic self-test -- no weights / footage needed
     dnb = BallEventDetector(homography=None, detect_bounces=False)
     assert all(dnb.update(i, t) is None for i, t in enumerate(floor)), "bounce not suppressed"
 
-    # PLAYER HIT: exactly ONE per racket-zone visit, at the deflection point. With NO
-    # wrist the same motion is dropped as noise.
-    wr = [(350, 300, "right")]                  # wrist; ball at x~500 -> ~150 px = racket head
+    # PLAYER HIT (strict): ball must come CLOSE to the wrist (<= player_contact_px) AND its
+    # trajectory must DEFLECT just after. wrist at (500,300); contact_px default 90.
+    wr = [(500, 300, "right")]
     def wn(seq):
         return [wr] * len(seq)
-    redir = [_trk(500, 300, 2000, 0), _trk(515, 300, 1800, 0), _trk(525, 300, -1700, 0)]
-    o = _run(redir, wn(redir))                                       # REDIRECT (reversed)
+    # 1) REVERSAL at the wrist -> exactly ONE hit, pinned to the contact point/frame.
+    redir = [_trk(300, 300, 1500, 0),    # far (d=200) -> init
+             _trk(450, 300, 1500, 0),    # d=50 near -> contact opens, approach vel stored
+             _trk(500, 300, -1500, 0)]   # reversed at the wrist -> deflection -> HIT
+    o = _run(redir, wn(redir))
     assert o.count("player_hit") == 1 and o[-1] == "player_hit", o
-    assert _run(redir)[-1] is None, _run(redir)                      # no wrist -> noise
-    stop = [_trk(500, 300, 1800, 0), _trk(512, 300, 1000, 0),
-            _trk(518, 300, 150, 0), _trk(524, 300, 500, 0)]          # STOP then leave
-    assert _run(stop, wn(stop)).count("player_hit") == 1, _run(stop, wn(stop))
-    drive = [_trk(500, 300, 200, 0), _trk(515, 300, 250, 0), _trk(545, 300, 1200, 0)]
-    assert _run(drive, wn(drive)).count("player_hit") == 1, _run(drive, wn(drive))   # DRIVE
-    # GRAB: ball IN the hand (AT the wrist, < racket_min) stopping -> NOT a hit
-    gw = [(508, 300, "right")]
-    grab = [_trk(500, 300, 800, 0), _trk(505, 300, 350, 0), _trk(508, 300, 40, 0)]
-    assert _run(grab, [gw, gw, gw]).count("player_hit") == 0, _run(grab, [gw, gw, gw])
+    assert _run(redir)[-1] is None, _run(redir)                      # NO wrist -> no hit
+    # 2) PASS-THROUGH: near the wrist but heading unchanged -> MISS (no hit).
+    passt = [_trk(300, 300, 1500, 0), _trk(460, 300, 1500, 0),
+             _trk(560, 300, 1500, 0), _trk(720, 300, 1500, 0)]
+    assert _run(passt, wn(passt)).count("player_hit") == 0, _run(passt, wn(passt))
+    # 3) GRAB: ball slows to a stop at the wrist but never reverses -> NOT a hit.
+    grab = [_trk(300, 300, 800, 0), _trk(470, 300, 400, 0),
+            _trk(500, 300, 30, 0), _trk(500, 300, 10, 0)]
+    assert _run(grab, wn(grab)).count("player_hit") == 0, _run(grab, wn(grab))
+    # 4) NO DOUBLE-HIT: a second reversal within the lock window is ignored.
+    dbl = [_trk(300, 300, 1500, 0), _trk(450, 300, 1500, 0), _trk(500, 300, -1500, 0),
+           _trk(450, 300, -1500, 0), _trk(500, 300, 1500, 0)]
+    assert _run(dbl, wn(dbl)).count("player_hit") == 1, _run(dbl, wn(dbl))
 
     # a smooth slow arc fires nothing
     smooth = [_trk(100, 100, 500, 100), _trk(130, 106, 500, 120), _trk(160, 113, 500, 140)]
@@ -426,6 +489,29 @@ if __name__ == "__main__":  # synthetic self-test -- no weights / footage needed
     dw.update(0, _trk(800, 300, 600, 0))
     evw = dw.update(1, _trk(800, 300, -600, 0))
     assert evw is not None and evw.type == "wall_bounce", evw
+
+    # FENCE HIT (OUT): a deflection inside a drawn FENCE region -> fence_hit, in_court False
+    fence = [[[750, 250], [850, 250], [850, 350], [750, 350]]]
+    df = BallEventDetector(homography=None, fence_regions=fence)
+    df.update(0, _trk(800, 300, 600, 0))
+    evf = df.update(1, _trk(800, 300, -600, 0))
+    assert evf is not None and evf.type == "fence_hit" and evf.in_court is False, evf
+    # fence takes PRIORITY over glass when a point is in both
+    dfp = BallEventDetector(homography=None, glass_regions=glass, fence_regions=fence)
+    dfp.update(0, _trk(800, 300, 600, 0))
+    evfp = dfp.update(1, _trk(800, 300, -600, 0))
+    assert evfp is not None and evfp.type == "fence_hit", evfp
+
+    # WALL HIT with NO drawn region: a sharp deflection that maps OUTSIDE the court floor.
+    # A tiny homography (1 px == 1 m, court 0..10 x 0..20) -> pixel (2000,2000) is far out.
+    from utils.homography import Homography as _H
+    import numpy as _np
+    Hm = _np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=float)
+    homo = _H(Hm, _np.linalg.inv(Hm))
+    dwall = BallEventDetector(homography=homo)              # ball at (2000,2000)=(2000m,2000m) -> outside
+    dwall.update(0, _trk(2000, 2000, 1500, 0))
+    evwall = dwall.update(1, _trk(2000, 2000, -1500, 0))    # reversal, far outside court
+    assert evwall is not None and evwall.type == "wall_bounce", evwall
 
     # NET HIT: a fast ball inside the net region whose speed COLLAPSES (stops at the net)
     netbox = [[0, 0], [100, 0], [100, 100], [0, 100]]

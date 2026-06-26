@@ -44,7 +44,125 @@
         669
       ]
     ],
-    "net_x": null
+    "net_x": null,
+    "fence": [
+      [
+        [
+          3717,
+          879
+        ],
+        [
+          3684,
+          1116
+        ],
+        [
+          3417,
+          999
+        ],
+        [
+          3357,
+          1455
+        ],
+        [
+          3222,
+          1467
+        ],
+        [
+          2967,
+          1200
+        ],
+        [
+          2997,
+          567
+        ]
+      ],
+      [
+        [
+          60,
+          942
+        ],
+        [
+          96,
+          1194
+        ],
+        [
+          345,
+          1035
+        ],
+        [
+          420,
+          1524
+        ],
+        [
+          534,
+          1527
+        ],
+        [
+          786,
+          1248
+        ],
+        [
+          756,
+          615
+        ]
+      ]
+    ],
+    "walls": [
+      [
+        [
+          945,
+          519
+        ],
+        [
+          750,
+          609
+        ],
+        [
+          792,
+          1248
+        ],
+        [
+          972,
+          1047
+        ]
+      ],
+      [
+        [
+          2778,
+          477
+        ],
+        [
+          2775,
+          1011
+        ],
+        [
+          2964,
+          1200
+        ],
+        [
+          2994,
+          567
+        ]
+      ],
+      [
+        [
+          2775,
+          477
+        ],
+        [
+          954,
+          516
+        ],
+        [
+          975,
+          1041
+        ],
+        [
+          2772,
+          1011
+        ]
+      ]
+    ]
   },
   "skeleton": {
     "keypoint_conf_threshold": 0.5
@@ -67,7 +185,10 @@
     "fp16": true,
     "crop": {
       "enabled": false,
-      "x_min": 0, "y_min": 224, "x_max": 3840, "y_max": 2160,
+      "x_min": 0,
+      "y_min": 224,
+      "x_max": 3840,
+      "y_max": 2160,
       "out_size": 768,
       "note": "y_min aligned to config-side1 (224) so it MATCHES the pooled training crop (the trainer applies the first config's crop to both cameras). Original polygon-derived y_min was 260; the extra 36px just gives a touch more lob airspace."
     },
