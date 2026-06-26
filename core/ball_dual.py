@@ -26,7 +26,7 @@ from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
-from core.ball_eval import _build_detector, _build_events, _build_tracker
+from core.ball_eval import _build_detector, _build_events, _build_tracker, _wrists
 from core.camera_calib import build_camera, triangulate_ball
 from utils.homography import COURT_LENGTH_M, Homography, draw_court_lines
 from utils.minimap import Minimap
@@ -114,6 +114,31 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     net_y = COURT_LENGTH_M / 2.0
     bounces = []                                     # accumulated landing-map points (x, y, in)
 
+    # pose -> wrists, needed for PLAYER HITS (a deflection only counts as a player hit at
+    # racket reach from a wrist; a net volley benefits too). ONE model instance serves both
+    # camera frames. Toggle via cfg_a ball.events.use_pose (default True).
+    pose = None
+    ev_cfg = cfg_a.get("ball", {}).get("events", {})
+    if (evA is not None or evB is not None) and ev_cfg.get("use_pose", True):
+        from core.detector import PoseDetector
+        dc = cfg_a.get("detection", {})
+        pose = PoseDetector(model_path=cfg_a["model"], device=cfg_a.get("device", "cuda"),
+                            conf_threshold=dc.get("conf_threshold", 0.3),
+                            iou_threshold=dc.get("iou_threshold", 0.5),
+                            imgsz=dc.get("imgsz", 1280))
+    kp_conf = cfg_a.get("skeleton", {}).get("keypoint_conf_threshold", 0.5)
+
+    # HIT accumulators (player_hit / net_hit): drawn on the panels, tallied, and logged.
+    # De-dup is across BOTH cameras -- one real hit can be seen by both -> count it ONCE.
+    hit_counts = {"player_hit": 0, "net_hit": 0}
+    recentA, recentB = deque(maxlen=60), deque(maxlen=60)
+    last_hit_frame = {"player_hit": -10 ** 9, "net_hit": -10 ** 9}
+    hit_dedup = int(cfg_a.get("ball", {}).get("fusion", {}).get("hit_dedup_frames", 5))
+    hcsv_path = os.path.join(out_dir, "ball_dual_hits.csv")
+    hcf = open(hcsv_path, "w", newline="")
+    hcw = csv.writer(hcf)
+    hcw.writerow(["frame", "camera", "type", "u_px", "v_px", "hand"])
+
     writer = None
     out_path = os.path.join(out_dir, "ball_dual.mp4")
     # per-frame ball-location log (ALWAYS written): each camera's image pixel + the shared
@@ -180,9 +205,15 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
             if -2.0 <= p[0] <= 12.0 and -2.0 <= p[1] <= 22.0:
                 court, source, color, n_b = p, "side-2", (255, 180, 0), n_b + 1
 
-        # --- bounce events: floor bounces kept only in each camera's OWNED (near) half ---
-        eA = evA.update(n, tA) if evA is not None else None
-        eB = evB.update(n, tB) if evB is not None else None
+        # wrists per camera (only when that camera has a ball -> skip pose on empty frames)
+        wristsA = (_wrists(pose.detect(fA), kp_conf)
+                   if (pose is not None and tA is not None and tA.x is not None) else None)
+        wristsB = (_wrists(pose.detect(fB), kp_conf)
+                   if (pose is not None and tB is not None and tB.x is not None) else None)
+
+        # --- events: floor bounces (landing map) + player/net HITS, per camera ---
+        eA = evA.update(n, tA, wristsA) if evA is not None else None
+        eB = evB.update(n, tB, wristsB) if evB is not None else None
         for ev, cam_name in ((eA, "side-1"), (eB, "side-2")):
             if ev is None or ev.type != "floor_bounce" or ev.x_m is None:
                 continue
@@ -191,6 +222,19 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
                 bounces.append((ev.x_m, ev.y_m, ev.in_court))
                 bw.writerow([n, cam_name, f"{ev.x_m:.3f}", f"{ev.y_m:.3f}",
                              "" if ev.in_court is None else int(ev.in_court)])
+
+        # --- PLAYER / NET hits: counted ONCE across both cameras (a hit one camera sees,
+        #     the other often sees too). The firing camera's panel shows the marker. ---
+        for ev, cam_name, recent in ((eA, "side-1", recentA), (eB, "side-2", recentB)):
+            if ev is None or ev.type not in ("player_hit", "net_hit"):
+                continue
+            if n - last_hit_frame[ev.type] < hit_dedup:
+                continue                              # duplicate of the other camera's hit
+            last_hit_frame[ev.type] = n
+            hit_counts[ev.type] += 1
+            recent.append((n, ev))
+            hcw.writerow([n, cam_name, ev.type, f"{ev.u:.1f}", f"{ev.v:.1f}",
+                          ev.player_hand or ""])
 
         # --- per-frame ball-location log: cam1/cam2 image px + shared court x/y/z (m) ---
         cw.writerow([
@@ -225,6 +269,19 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
         cv2.putText(pA, "SIDE 1", (12, 32), _FONT, 1.0, (255, 255, 255), 2)
         cv2.putText(pB, "SIDE 2", (12, 32), _FONT, 1.0, (255, 255, 255), 2)
 
+        # recent PLAYER (magenta) / NET (cyan) hit markers on each panel, kept ~1 s
+        for recent, panel, scale in ((recentA, pA, sA), (recentB, pB, sB)):
+            for fno, ev in recent:
+                age = n - fno
+                if age > 20:
+                    continue
+                hcol = (255, 0, 255) if ev.type == "player_hit" else (255, 255, 0)
+                hx, hy = int(ev.u * scale), int(ev.v * scale)
+                cv2.drawMarker(panel, (hx, hy), hcol, cv2.MARKER_DIAMOND, 26, 3)
+                if age <= 7:
+                    cv2.putText(panel, ev.type.replace("_", " ").upper(), (hx + 14, hy),
+                                _FONT, 0.6, hcol, 2)
+
         # --- top-down court with the one shared ball + recent trajectory trail ---
         # trail ONLY the RELIABLE (triangulated, both-camera) positions -- single-camera
         # floor projections jump for an airborne ball, so they are NOT trailed (the ball
@@ -257,6 +314,17 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
         comp = cv2.hconcat([pA, pB,
                             cv2.resize(mimg, (int(mm.w * panel_h / mm.h), panel_h))])
 
+        # running tally (top-right of the composite): hits + accumulated landings
+        for i, (lab, val, hcol) in enumerate(
+                (("PLAYER HITS", hit_counts["player_hit"], (255, 0, 255)),
+                 ("NET HITS", hit_counts["net_hit"], (255, 255, 0)),
+                 ("BOUNCES", len(bounces), (0, 165, 255)))):
+            txt = f"{lab}: {val}"
+            (tw, _t), _bl = cv2.getTextSize(txt, _FONT, 0.8, 2)
+            tx, ty = comp.shape[1] - tw - 16, 34 + i * 34
+            cv2.putText(comp, txt, (tx, ty), _FONT, 0.8, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(comp, txt, (tx, ty), _FONT, 0.8, hcol, 2, cv2.LINE_AA)
+
         if save_video:
             if writer is None:
                 writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps,
@@ -275,6 +343,7 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     rB.stop()
     cf.close()
     bf.close()
+    hcf.close()
     if writer is not None:
         writer.release()
     if show:
@@ -284,20 +353,36 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
           f"(connected {100*(n_both+n_a+n_b)/max(1,n):.0f}% of frames).")
     print(f"[ball-dual]   locations -> {csv_path}")
     print(f"[ball-dual]   bounces   -> {bcsv_path} ({len(bounces)} near-half landings)")
+    print(f"[ball-dual]   hits      -> {hcsv_path} "
+          f"({hit_counts['player_hit']} player, {hit_counts['net_hit']} net)")
     if save_video:
         print(f"[ball-dual]   video -> {out_path}")
     return out_path if save_video else ""
 
 
 if __name__ == "__main__":
+    import argparse
     import json
-    import sys
 
-    cpa = sys.argv[1] if len(sys.argv) > 1 else "config-side1.json"
-    cpb = sys.argv[2] if len(sys.argv) > 2 else "config-side2.json"
-    mf = int(sys.argv[3]) if len(sys.argv) > 3 else None
-    with open(cpa, "r", encoding="utf-8") as f:
+    # Flag-based CLI: the two config paths stay positional, but --show /
+    # --save-video / --max-frames are real flags (not parsed by position).
+    # On a headless box (RunPod) pass --save-video; on your laptop pass --show.
+    ap = argparse.ArgumentParser(
+        description="Dual-view ball tracking (side-1 | side-2 | top-down court)")
+    ap.add_argument("config_a", nargs="?", default="config-side1.json",
+                    help="side-1 config (has the sync block)")
+    ap.add_argument("config_b", nargs="?", default="config-side2.json",
+                    help="side-2 config")
+    ap.add_argument("--show", action="store_true", help="display the live window")
+    ap.add_argument("--save-video", action="store_true",
+                    help="write output/ball_dual.mp4")
+    ap.add_argument("--max-frames", type=int, default=None,
+                    help="stop after N frames (quick spot-check)")
+    args = ap.parse_args()
+
+    with open(args.config_a, "r", encoding="utf-8") as f:
         ca = json.load(f)
-    with open(cpb, "r", encoding="utf-8") as f:
+    with open(args.config_b, "r", encoding="utf-8") as f:
         cb = json.load(f)
-    run_dual_view(ca, cb, max_frames=mf, save_video=True)
+    run_dual_view(ca, cb, max_frames=args.max_frames,
+                  show=args.show, save_video=args.save_video)

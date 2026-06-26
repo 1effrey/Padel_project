@@ -64,6 +64,7 @@
     "input_width": 512,
     "input_height": 288,
     "in_frames": 3,
+    "fp16": true,
     "crop": {
       "enabled": false,
       "x_min": 0, "y_min": 224, "x_max": 3840, "y_max": 2160,

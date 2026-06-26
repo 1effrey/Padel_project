@@ -158,62 +158,11 @@ class TrackNetV2(nn.Module):
 #   Keeping them in one place prevents train/infer skew -- a classic, silent cause
 #   of "the model trained fine but detects nothing live".
 # --------------------------------------------------------------------------- #
-def resolve_crop(crop: Optional[Dict[str, Any]], frame_w: int, frame_h: int
-                 ) -> Optional[Tuple[int, int, int, int]]:
-    """Return the court-crop box (x0, y0, x1, y1) CLAMPED to the frame, or None when
-    cropping is disabled / absent / degenerate. ONE place decides the box so training
-    and inference can never disagree about it (the classic train/infer-skew trap)."""
-    if not crop or not crop.get("enabled", False):
-        return None
-    x0 = max(0, int(crop["x_min"]))
-    y0 = max(0, int(crop["y_min"]))
-    x1 = min(int(frame_w), int(crop["x_max"]))
-    y1 = min(int(frame_h), int(crop["y_max"]))
-    if x1 - x0 < 2 or y1 - y0 < 2:                # degenerate box -> ignore it
-        return None
-    return (x0, y0, x1, y1)
-
-
-def preprocess_frame(frame: np.ndarray, net_w: int, net_h: int,
-                     crop: Optional[Dict[str, Any]] = None) -> np.ndarray:
-    """BGR full-frame -> (3, net_h, net_w) RGB float32 in [0, 1] for TrackNetV2.
-
-    When `crop` is enabled the COURT BOX is cut out FIRST, then scaled into the net
-    tensor -- the 'label-aware court crop' that gives the tiny ball real pixel density
-    instead of starving it in a full-frame downscale. INTER_AREA is the correct
-    area-averaging filter for downscaling and also smooths some low-bitrate macroblock
-    noise (a small free win on the ~2 Mbps feed)."""
-    box = resolve_crop(crop, frame.shape[1], frame.shape[0])
-    if box is not None:
-        x0, y0, x1, y1 = box
-        frame = frame[y0:y1, x0:x1]
-    img = cv2.resize(frame, (net_w, net_h), interpolation=cv2.INTER_AREA)
+def preprocess_frame(frame: np.ndarray, net_w: int, net_h: int) -> np.ndarray:
+    """BGR full-frame -> (3, net_h, net_w) RGB float32 in [0, 1] for TrackNetV2."""
+    img = cv2.resize(frame, (net_w, net_h))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     return np.transpose(img, (2, 0, 1))           # HWC -> CHW
-
-
-def label_to_net(u: float, v: float, net_w: int, net_h: int,
-                 orig_w: int, orig_h: int,
-                 crop: Optional[Dict[str, Any]] = None) -> Tuple[float, float]:
-    """Map a FULL-RES label pixel (u, v) into NETWORK pixels, matching
-    preprocess_frame's crop+scale EXACTLY so the heatmap peak lands on the ball."""
-    box = resolve_crop(crop, orig_w, orig_h)
-    if box is not None:
-        x0, y0, x1, y1 = box
-        return (u - x0) * net_w / (x1 - x0), (v - y0) * net_h / (y1 - y0)
-    return u * net_w / orig_w, v * net_h / orig_h
-
-
-def net_to_full(u_net: float, v_net: float, net_w: int, net_h: int,
-                orig_w: int, orig_h: int,
-                crop: Optional[Dict[str, Any]] = None) -> Tuple[float, float]:
-    """Inverse of label_to_net: a NETWORK-pixel detection -> FULL-RES image pixels, so
-    the ball lines up with the court polygon, homography, players and minimap."""
-    box = resolve_crop(crop, orig_w, orig_h)
-    if box is not None:
-        x0, y0, x1, y1 = box
-        return u_net * (x1 - x0) / net_w + x0, v_net * (y1 - y0) / net_h + y0
-    return u_net * orig_w / net_w, v_net * orig_h / net_h
 
 
 def make_gaussian_heatmap(net_w: int, net_h: int,
@@ -252,10 +201,9 @@ class BallDetector:
         in_frames: int = 3,
         heatmap_threshold: float = 0.5,
         min_blob_area: int = 2,
-        max_blob_area: int = 0,
         court_polygon: Optional[Any] = None,
         roi_margin_px: float = 0.0,
-        crop: Optional[Dict[str, Any]] = None,
+        fp16: bool = False,
     ) -> None:
         self.net_w = int(input_width)
         self.net_h = int(input_height)
@@ -265,18 +213,12 @@ class BallDetector:
         # empty heatmap cleanly while leaving any sane configured value untouched.
         self.heatmap_threshold = max(float(heatmap_threshold), 1e-6)
         self.min_blob_area = int(min_blob_area)
-        # Reject OVERSIZED heatmap blobs (a bright light / big reflection responds as a
-        # large region; the ball is always a small, tight blob). 0 disables the cap.
-        self.max_blob_area = int(max_blob_area)
         # Optional COURT ROI: reject ball detections outside the court polygon
         # (dilated by roi_margin_px) -> kills background lights / out-of-court blobs.
         # The ball flies above the floor and off the glass, so the margin gives the
         # airspace headroom; None = no spatial filter.
         self.court_polygon = court_polygon
         self.roi_margin_px = float(roi_margin_px)
-        # Court-crop box (or None). Applied in _preprocess and inverted in
-        # _heatmap_to_detection so detections come back in FULL-RES pixels.
-        self.crop = crop
 
         # --- pick the device, falling back to CPU if CUDA was asked for but is not
         #     actually available (the config sometimes says "CUDA"/"cuda") ---
@@ -287,10 +229,23 @@ class BallDetector:
             want = "cpu"
         self.device = torch.device("cuda" if "cuda" in want else "cpu")
 
+        # --- half-precision (FP16) is INFERENCE-ONLY and CUDA-ONLY. On a 6 GB GPU it
+        #     roughly halves VRAM and speeds the forward pass ~2x with no change to
+        #     the detection output. On CPU, FP16 is unsupported/slow, so we silently
+        #     stay in FP32 (and say so once if it was asked for). ---
+        self.use_fp16 = bool(fp16) and self.device.type == "cuda"
+        if fp16 and not self.use_fp16:
+            print("[ball] note: fp16 requested but device is CPU -> staying FP32 "
+                  "(FP16 is CUDA-only).")
+
         # --- build the model and (try to) load weights ---
         self.weights_path = weights_path
         self.model = TrackNetV2(in_frames=self.in_frames).to(self.device).eval()
         self.has_weights = self._load_weights(weights_path)
+        # Weights load as FP32 (above); cast the whole model to half AFTER loading so
+        # the on-disk checkpoint stays FP32 and only the in-memory model runs FP16.
+        if self.use_fp16:
+            self.model = self.model.half()
         # `operational` = "can this detector actually produce detections right now?"
         # The eval harness keys off THIS (not has_weights) so it works for any
         # backend -- the motion baseline sets operational=True with no weights.
@@ -306,7 +261,9 @@ class BallDetector:
             print("[ball] " + "=" * 64)
         else:
             print(f"[ball] TrackNetV2 weights loaded from {weights_path} "
-                  f"(device={self.device}, in_frames={self.in_frames}, "
+                  f"(device={self.device}, precision="
+                  f"{'fp16' if self.use_fp16 else 'fp32'}, "
+                  f"in_frames={self.in_frames}, "
                   f"input={self.net_w}x{self.net_h}).")
 
         # rolling buffer of the last `in_frames` preprocessed frames (CHW, RGB, 0..1)
@@ -391,9 +348,8 @@ class BallDetector:
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
         """BGR full-frame -> (3, net_h, net_w) RGB float32 in [0, 1] for the net.
-        Delegates to the shared module helper (crop included) so training matches
-        inference."""
-        return preprocess_frame(frame, self.net_w, self.net_h, self.crop)
+        Delegates to the shared module helper so training matches inference."""
+        return preprocess_frame(frame, self.net_w, self.net_h)
 
     def _infer(self) -> np.ndarray:
         """Run the model on the current buffer and return the heatmap as numpy.
@@ -402,9 +358,14 @@ class BallDetector:
         channel axis to make the (3*in_frames, H, W) stack TrackNet expects."""
         stack = np.concatenate(list(self._buffer), axis=0)        # (3*in_frames,H,W)
         tensor = torch.from_numpy(stack).unsqueeze(0).to(self.device)  # (1,C,H,W)
+        # match the input dtype to the model: FP16 model needs an FP16 input tensor.
+        if self.use_fp16:
+            tensor = tensor.half()
         with torch.no_grad():
             out = self.model(tensor)                              # (1,1,H,W)
-        return out[0, 0].detach().cpu().numpy()
+        # cast back to float32 before numpy: cv2/numpy postprocessing expects float32
+        # (an FP16 array would break connectedComponents / weighted-centroid maths).
+        return out[0, 0].float().detach().cpu().numpy()
 
     def _heatmap_to_detection(
         self, heatmap: np.ndarray, orig_w: int, orig_h: int
@@ -426,25 +387,19 @@ class BallDetector:
         mask = (heatmap >= self.heatmap_threshold).astype(np.uint8)
         n_labels, labels, stats, _cent = cv2.connectedComponentsWithStats(mask, 8)
 
+        sx, sy = orig_w / self.net_w, orig_h / self.net_h
         cands: List[Tuple[float, float, float]] = []   # (blob_peak, u, v), in-ROI only
         rejected_by_roi = False
         for lab in range(1, n_labels):
-            area = int(stats[lab, cv2.CC_STAT_AREA])
-            if area < self.min_blob_area:
+            if stats[lab, cv2.CC_STAT_AREA] < self.min_blob_area:
                 continue
-            if self.max_blob_area and area > self.max_blob_area:
-                continue                          # oversized -> a light/reflection, not the ball
             ys, xs = np.where(labels == lab)
             w = heatmap[ys, xs]
             denom = float(np.sum(w))
             if denom <= 0.0:                 # defensive: never divide by zero -> NaN
                 continue
-            # net-pixel intensity-weighted centroid (sub-pixel) -> FULL-RES pixels,
-            # inverting the court crop so (u, v) line up with the rest of the pipeline.
-            u_net = float(np.sum(xs * w) / denom)
-            v_net = float(np.sum(ys * w) / denom)
-            u, v = net_to_full(u_net, v_net, self.net_w, self.net_h,
-                               orig_w, orig_h, self.crop)
+            u = float(np.sum(xs * w) / denom) * sx
+            v = float(np.sum(ys * w) / denom) * sy
             if not self._in_roi(u, v):
                 rejected_by_roi = True       # out-of-court (e.g. a ceiling light)
                 continue

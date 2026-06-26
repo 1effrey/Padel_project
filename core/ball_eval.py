@@ -33,8 +33,8 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections import deque
-from typing import Any, Dict, List, Optional
+from collections import defaultdict, deque
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -90,10 +90,10 @@ def _build_detector(config: Dict[str, Any]):
         in_frames=ball.get("in_frames", 3),
         heatmap_threshold=ball.get("heatmap_threshold", 0.5),
         min_blob_area=ball.get("min_blob_area", 2),
-        max_blob_area=ball.get("max_blob_area", 0),
         court_polygon=(court_poly if roi_on else None),
         roi_margin_px=roi_margin,
-        crop=ball.get("crop"),                 # court-crop box (or None) -> ball-only
+        # FP16 half-precision inference (CUDA only); default off -> unchanged behavior.
+        fp16=ball.get("fp16", False),
     )
 
 
@@ -159,12 +159,21 @@ def _draw_track(frame: np.ndarray, track, trail, disp) -> None:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
 
-def _build_events(config: Dict[str, Any], homography):
+def _build_events(config: Dict[str, Any], homography, detect_bounces: Optional[bool] = None):
     """Build the Phase-3 event detector from config['ball']['events'] (or None when
-    disabled). Needs the homography for court metres / in-out."""
+    disabled). Needs the homography for court metres / in-out.
+
+    `detect_bounces` is a PER-RUNNER decision, not a shared-config one: each caller says
+    whether IT wants floor/wall bounces. Default (None) -> bounces ON, which preserves
+    the existing 3D/bounce callers (ball_3d, ball_dual, ball_case_audit) exactly. The hit
+    runner below passes detect_bounces=False, so it contributes only player_hit / net_hit
+    and lets the existing bounce stack own bounces (no double-counting). net_polygon (from
+    court calib) gates net hits; court.walls (optional) gates wall bounces when on."""
     e = config.get("ball", {}).get("events", {})
     if not e.get("enabled", True):
         return None
+    if detect_bounces is None:
+        detect_bounces = e.get("detect_bounces", True)
     return BallEventDetector(
         homography=homography,
         min_vy_px_s=e.get("min_vy_px_s", 500.0),
@@ -172,16 +181,51 @@ def _build_events(config: Dict[str, Any], homography):
         wall_margin_m=e.get("wall_margin_m", 0.6),
         hit_angle_deg=e.get("hit_angle_deg", 70.0),
         hit_min_speed_px_s=e.get("hit_min_speed_px_s", 1500.0),
+        hit_min_speed_gain_px_s=e.get("hit_min_speed_gain_px_s", 800.0),
+        racket_reach_px=e.get("racket_reach_px", 220.0),
+        racket_min_px=e.get("racket_min_px", 70.0),
+        player_turn_deg=e.get("player_turn_deg", 60.0),
+        player_min_speed_px_s=e.get("player_min_speed_px_s", 300.0),
+        player_speed_drop=e.get("player_speed_drop", 0.5),
+        player_drive_ratio=e.get("player_drive_ratio", 3.0),
+        player_cooldown_frames=e.get("player_cooldown_frames", 10),
+        net_polygon=config.get("court", {}).get("net_polygon"),
+        net_min_speed_px_s=e.get("net_min_speed_px_s", 600.0),
+        net_speed_drop=e.get("net_speed_drop", 0.45),
+        net_turn_deg=e.get("net_turn_deg", 40.0),
+        net_margin_px=e.get("net_margin_px", 120.0),
         refractory_frames=e.get("refractory_frames", 3),
         in_out_margin_m=e.get("in_out_margin_m", 0.1),
-        near_court_margin_m=e.get("near_court_margin_m", 1.5),
+        detect_bounces=detect_bounces,
+        glass_regions=config.get("court", {}).get("walls"),
     )
 
 
+# COCO-17 wrist keypoint indices (left, right)
+_LEFT_WRIST, _RIGHT_WRIST = 9, 10
+
+
+def _wrists(pose_dets: List[Dict[str, Any]], kp_conf: float) -> List[Tuple[float, float, str]]:
+    """Pull (u, v, hand) wrist points from the pose detections (confident ones only).
+    player_hit needs these: a deflection is only a PLAYER hit if it happens at racket
+    reach from a wrist. Trustworthy for the NEAR player; far-side keypoints are noisy."""
+    out: List[Tuple[float, float, str]] = []
+    for d in pose_dets:
+        kp = d.get("keypoints")
+        if kp is None:
+            continue
+        for idx, hand in ((_LEFT_WRIST, "left"), (_RIGHT_WRIST, "right")):
+            x, y, c = kp[idx]
+            if float(c) >= kp_conf:
+                out.append((float(x), float(y), hand))
+    return out
+
+
 def _draw_events(frame: np.ndarray, recent_events, cur_frame: int, ttl: int = 25) -> None:
-    """Mark recent events: green diamond = floor bounce, orange = wall, red = hit.
-    The label (with in/out + court metres) shows for the first few frames."""
-    colors = {"floor_bounce": (0, 255, 0), "wall_bounce": (255, 128, 0), "hit": (0, 0, 255)}
+    """Mark recent events: green diamond = floor bounce, orange = wall, red = hit,
+    magenta = player hit, cyan = net hit. The label shows for the first few frames."""
+    colors = {"floor_bounce": (0, 255, 0), "wall_bounce": (255, 128, 0),
+              "hit": (0, 0, 255), "player_hit": (255, 0, 255), "net_hit": (255, 255, 0)}
     for fno, ev in recent_events:
         age = cur_frame - fno
         if age > ttl:
@@ -235,9 +279,27 @@ def run_ball_eval(
     trail: "deque" = deque(maxlen=max(1, trail_len))
 
     homog = Homography.from_config(config)
-    events = _build_events(config, homog)
+    # bounces OFF in THIS runner: the existing 3D/bounce stack owns floor/wall bounces,
+    # so the event detector here contributes only player_hit / net_hit (no double-count).
+    events = _build_events(config, homog, detect_bounces=False)
     recent_events: "deque" = deque(maxlen=90)   # for persistent on-frame markers
-    event_counts = {"floor_bounce": 0, "wall_bounce": 0, "hit": 0}
+    event_counts: Dict[str, int] = defaultdict(int)   # any event type -> count (no KeyError)
+
+    # pose -> wrists, needed for player_hit. Built only when events are on AND pose is
+    # enabled (config ball.events.use_pose, default True). Skipped otherwise so a pure
+    # ball-quality run doesn't pay for a YOLO-pose pass it doesn't need.
+    pose = None
+    ev_cfg = config.get("ball", {}).get("events", {})
+    if events is not None and ev_cfg.get("use_pose", True):
+        from core.detector import PoseDetector
+        dc = config.get("detection", {})
+        pose = PoseDetector(
+            model_path=config["model"], device=config.get("device", "cuda"),
+            conf_threshold=dc.get("conf_threshold", 0.3),
+            iou_threshold=dc.get("iou_threshold", 0.5),
+            imgsz=dc.get("imgsz", 1280))
+    kp_conf = config.get("skeleton", {}).get("keypoint_conf_threshold", 0.5)
+
     if events is not None and homog is None:
         print("[ball-eval] note: no homography in this config -> events fire but lack "
               "court metres / in-out. Use config-side1.json for full Phase-3 output.")
@@ -280,7 +342,11 @@ def run_ball_eval(
         track = (tracker.update_multi(getattr(detector, "last_candidates", []))
                  if tracker is not None else None)
 
-        ev = events.update(n, track) if events is not None else None
+        # wrists only when the ball is in play -> don't run pose on empty frames
+        wrists: List[Tuple[float, float, str]] = []
+        if pose is not None and track is not None and track.x is not None:
+            wrists = _wrists(pose.detect(frame), kp_conf)
+        ev = events.update(n, track, wrists or None) if events is not None else None
         if ev is not None:
             event_counts[ev.type] += 1
             recent_events.append((n, ev))
@@ -420,8 +486,11 @@ def run_ball_eval(
                   f"outliers_rejected={tr['frames_gated']})  <- Kalman vs "
                   f"{summary['detection_rate']*100:.1f}% raw")
         if events is not None:
-            print(f"[ball-eval] events: {event_counts['floor_bounce']} floor bounces, "
-                  f"{event_counts['wall_bounce']} wall bounces, {event_counts['hit']} hits")
+            print(f"[ball-eval] events: {event_counts['player_hit']} player hits, "
+                  f"{event_counts['net_hit']} net hits, "
+                  f"{event_counts['floor_bounce']} floor bounces, "
+                  f"{event_counts['wall_bounce']} wall bounces "
+                  f"(bounces OFF by default -> owned by the 3D/bounce stack)")
     print(f"[ball-eval] metrics -> {metrics_path}")
     print(f"[ball-eval] per-frame log -> {os.path.join(out_dir, 'ball_eval.jsonl')}")
     return summary
