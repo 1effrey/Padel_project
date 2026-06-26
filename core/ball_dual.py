@@ -19,7 +19,11 @@ in one consistent top-down map.
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
+import math
 import os
+import re
 from collections import deque
 from typing import Any, Dict, Optional, Tuple
 
@@ -92,6 +96,88 @@ def _ball_uv(track) -> Optional[Tuple[float, float]]:
     return None
 
 
+def _fmt(v, prec: int = 3) -> str:
+    """CSV cell: a number at `prec` decimals, or '' for missing (None/NaN). Never coerce a
+    missing value to 0 -- 0 is a real coordinate/speed, '' means 'not measured'."""
+    if v is None:
+        return ""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if math.isnan(f):
+        return ""
+    return f"{f:.{prec}f}"
+
+
+def _px_speed_to_mps(homog, u, v, vx, vy, fps) -> Optional[float]:
+    """Convert a pixel-space velocity (px/s) at image point (u, v) to court m/s, using the
+    homography to measure how far the ball moves in metres over one frame. Floor-plane
+    approximation (exact on the ground; approximate for an airborne ball)."""
+    if homog is None or not fps or u is None or vx is None:
+        return None
+    dt = 1.0 / fps
+    m0 = homog.pixel_to_meters((u, v))
+    m1 = homog.pixel_to_meters((u + vx * dt, v + vy * dt))
+    return math.hypot(m1[0] - m0[0], m1[1] - m0[1]) * fps
+
+
+def _angle_deg(vx, vy) -> Optional[float]:
+    """Heading of a velocity vector in degrees (image space), or None if no motion."""
+    if vx is None or (abs(vx) < 1e-9 and abs(vy) < 1e-9):
+        return None
+    return math.degrees(math.atan2(vy, vx))
+
+
+def _turn_deg(vx_in, vy_in, vx_out, vy_out) -> Optional[float]:
+    """Angle between incoming and outgoing velocity (0 = straight through, 180 = reversed)."""
+    if None in (vx_in, vy_in, vx_out, vy_out):
+        return None
+    a = math.hypot(vx_in, vy_in)
+    b = math.hypot(vx_out, vy_out)
+    if a < 1e-9 or b < 1e-9:
+        return None
+    cosang = max(-1.0, min(1.0, (vx_in * vx_out + vy_in * vy_out) / (a * b)))
+    return math.degrees(math.acos(cosang))
+
+
+def _next_run_dir(out_dir: str) -> str:
+    """Create and return a fresh per-run folder so outputs are NEVER overwritten:
+    output/run_001, run_002, ... The next number is one past the highest existing run."""
+    os.makedirs(out_dir, exist_ok=True)
+    nums = []
+    for name in os.listdir(out_dir):
+        m = re.fullmatch(r"run_?(\d+)", name)
+        if m and os.path.isdir(os.path.join(out_dir, name)):
+            nums.append(int(m.group(1)))
+    run_dir = os.path.join(out_dir, f"run_{(max(nums) + 1) if nums else 1:03d}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
+
+
+def _write_meta(out_dir, cfg_a, cfg_b, cfg_a_path, cfg_b_path, fps, width, height,
+                frame_count) -> None:
+    """Sidecar so frames<->seconds convert and a run is traceable to its inputs."""
+    wpath = cfg_a.get("ball", {}).get("weights")
+    wmd5 = None
+    if wpath and os.path.isfile(wpath):
+        h = hashlib.md5()
+        with open(wpath, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        wmd5 = h.hexdigest()
+    meta = {
+        "run_id": os.path.basename(out_dir.rstrip("/\\")),
+        "video_a": cfg_a.get("source"), "video_b": cfg_b.get("source"),
+        "fps": fps, "width": width, "height": height, "frame_count": frame_count,
+        "weights_md5": wmd5,
+        "heatmap_threshold": cfg_a.get("ball", {}).get("heatmap_threshold"),
+        "config_a": cfg_a_path, "config_b": cfg_b_path,
+    }
+    with open(os.path.join(out_dir, "ball_dual_meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+
 def _draw_ball_trail(panel: np.ndarray, trail, scale: float,
                      color: Tuple[int, int, int] = (0, 255, 255)) -> None:
     """Draw the ball's recent path as a fading, tapering tail on a SCALED panel, with a
@@ -120,11 +206,14 @@ def _draw_ball_trail(panel: np.ndarray, trail, scale: float,
 def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
                   max_frames: Optional[int] = None, show: bool = False,
                   save_video: bool = False, yellow_gate: bool = False,
-                  panel_h: int = 540) -> str:
+                  panel_h: int = 540, cfg_a_path: Optional[str] = None,
+                  cfg_b_path: Optional[str] = None) -> str:
     """Run both cameras synced, side by side, with a shared top-down court showing one
     cross-camera ball. Returns the output video path (or '')."""
-    out_dir = cfg_a.get("output", {}).get("dir", "output")
-    os.makedirs(out_dir, exist_ok=True)
+    # versioned per-run folder (output/run_001, run_002, ...) so a new run NEVER overwrites
+    # an earlier one -- all CSVs, the video and the meta sidecar land inside it.
+    out_dir = _next_run_dir(cfg_a.get("output", {}).get("dir", "output"))
+    print(f"[ball-dual] writing this run's outputs to {out_dir}")
 
     sync = cfg_a.get("sync")
     if not sync or sync.get("offset_frames") is None:
@@ -135,6 +224,13 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     rA = ThreadedVideoReader(cfg_a["source"], hw_accel=dec.get("hw_accel", True), start_frame=0)
     rB = ThreadedVideoReader(cfg_b["source"], hw_accel=dec.get("hw_accel", True), start_frame=offset)
     fps = rA.fps or 20.0
+
+    # traceability sidecar (frames<->seconds, inputs + weights). frame_count from the clip.
+    _cap = cv2.VideoCapture(cfg_a["source"])
+    frame_count = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
+    _cap.release()
+    _write_meta(out_dir, cfg_a, cfg_b, cfg_a_path, cfg_b_path, fps,
+                rA.width, rA.height, frame_count)
 
     camA, dA = build_camera(cfg_a, rA.width, rA.height, is_side2=False)
     camB, dB = build_camera(cfg_b, rB.width, rB.height, is_side2=True, focal_override=dA["f"])
@@ -182,7 +278,19 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     hcsv_path = os.path.join(out_dir, "ball_dual_hits.csv")
     hcf = open(hcsv_path, "w", newline="")
     hcw = csv.writer(hcf)
-    hcw.writerow(["frame", "camera", "type", "u_px", "v_px", "hand"])
+    # shot-classifier feature+label table. type = the rule-based WEAK label; shot_label /
+    # label_correct are empty ground-truth columns for hand-labelling. Tier-3 columns
+    # (rally_id, shot_index, player_*) are present for a stable schema, filled later.
+    hcw.writerow([
+        "event_id", "frame", "t_s", "camera", "rally_id", "shot_index",
+        "type", "shot_label", "label_correct",
+        "u_px", "v_px", "x_m", "y_m", "z_m", "dist_to_net_m", "in_court",
+        "speed_in_mps", "speed_out_mps", "speed_change_mps",
+        "turn_angle_deg", "incoming_angle_deg", "outgoing_angle_deg",
+        "hand", "player_id", "player_x_m", "player_y_m", "player_dist_to_ball_m",
+        "n_cams", "ball_conf",
+    ])
+    hit_seq = 0   # stable event_id counter (deterministic: frames processed in order)
 
     writer = None
     out_path = os.path.join(out_dir, "ball_dual.mp4")
@@ -191,15 +299,25 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     csv_path = os.path.join(out_dir, "ball_dual_locations.csv")
     cf = open(csv_path, "w", newline="")
     cw = csv.writer(cf)
-    cw.writerow(["frame", "cam1_detected", "cam1_x_px", "cam1_y_px",
-                 "cam2_detected", "cam2_x_px", "cam2_y_px",
-                 "court_x_m", "court_y_m", "court_z_m", "source"])
+    # per-frame detector-optimization table. heatmap_peak is the hard-example-mining signal
+    # (low peak = uncertain frame); gap_len = frames since that camera last detected.
+    cw.writerow([
+        "frame", "t_s", "source", "n_cams",
+        "cam1_detected", "cam1_x_px", "cam1_y_px",
+        "cam1_heatmap_peak", "cam1_conf", "cam1_gap_len",
+        "cam2_detected", "cam2_x_px", "cam2_y_px",
+        "cam2_heatmap_peak", "cam2_conf", "cam2_gap_len",
+        "court_x_m", "court_y_m", "court_z_m", "reproj_err_px",
+    ])
+    gapA = gapB = 0   # frames since last detection, per camera
     # accurate bounce/landing log -- floor bounces only, each from the camera that owns
     # that half (so the court x/y is the trustworthy ground-contact position).
     bcsv_path = os.path.join(out_dir, "ball_dual_bounces.csv")
     bf = open(bcsv_path, "w", newline="")
     bw = csv.writer(bf)
-    bw.writerow(["frame", "camera", "court_x_m", "court_y_m", "in_court"])
+    bw.writerow(["event_id", "frame", "t_s", "camera", "rally_id",
+                 "court_x_m", "court_y_m", "z_m", "in_court"])
+    bounce_seq = 0   # stable event_id counter for bounces
     if show:
         cv2.namedWindow("Ball Dual (side-1 | side-2 | court)", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Ball Dual (side-1 | side-2 | court)", 1700, 600)
@@ -226,6 +344,16 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
         seenA = measA and (not yellow_gate or _is_yellow(fA, *uvA))   # "yellow + moving"
         seenB = measB and (not yellow_gate or _is_yellow(fB, *uvB))
 
+        # detector logging signals (no behavior change): heatmap peak, chosen-detection
+        # confidence, and frames-since-last-detection per camera.
+        peakA, peakB = detA.last_heatmap_peak, detB.last_heatmap_peak
+        candA, candB = getattr(detA, "last_candidates", []), getattr(detB, "last_candidates", [])
+        confA = candA[0].confidence if (seenA and candA) else None
+        confB = candB[0].confidence if (seenB and candB) else None
+        gapA = 0 if seenA else gapA + 1
+        gapB = 0 if seenB else gapB + 1
+        n_cams = int(seenA) + int(seenB)
+
         # --- ball court position. TRIANGULATION (both cameras) is the reliable 3D: it places
         #     the ball correctly even when AIRBORNE, and gives x, y AND the real height z.
         #     A SINGLE camera can only FLOOR-project (homography, z=0) -- correct for a ball
@@ -235,11 +363,13 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
         #     blank unless triangulated -- never assumed 0. ---
         court = source = color = None
         court_z = None
+        reproj = None                                      # triangulation residual (px)
         if seenA and seenB:
             res = triangulate_ball(camA, camB, uvA, uvB, max_reproj)
             if res is not None:
                 court = (float(res["X"][0]), float(res["X"][1]))    # triangulated x, y (in-bounds)
                 court_z = float(res["X"][2])                        # real triangulated height (m)
+                reproj = res.get("reproj_px")
                 source, color, n_both = "both (3D)", (0, 220, 0), n_both + 1
         if court is None and seenA and homA is not None:
             p = homA.pixel_to_meters(uvA)
@@ -265,8 +395,12 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
             owns = (ev.y_m < net_y) if cam_name == "side-1" else (ev.y_m >= net_y)
             if owns:
                 bounces.append((ev.x_m, ev.y_m, ev.in_court))
-                bw.writerow([n, cam_name, f"{ev.x_m:.3f}", f"{ev.y_m:.3f}",
-                             "" if ev.in_court is None else int(ev.in_court)])
+                bounce_seq += 1
+                bw.writerow([
+                    f"bounce_{bounce_seq:06d}", n, _fmt(n / fps), cam_name, "",   # rally_id: tier-3
+                    _fmt(ev.x_m), _fmt(ev.y_m), _fmt(0.0),                        # z_m ~ 0 at floor
+                    "" if ev.in_court is None else int(ev.in_court),
+                ])
 
         # --- PLAYER / NET / WALL / FENCE hits: counted ONCE across both cameras (a hit one
         #     camera sees, the other often sees too). The firing camera's panel shows it. ---
@@ -278,19 +412,38 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
             last_hit_frame[ev.type] = n
             hit_counts[ev.type] += 1
             recent.append((n, ev))
-            hcw.writerow([n, cam_name, ev.type, f"{ev.u:.1f}", f"{ev.v:.1f}",
-                          ev.player_hand or ""])
+            hit_seq += 1
+            homE = homA if cam_name == "side-1" else homB
+            confE = confA if cam_name == "side-1" else confB
+            # kinematics from the event's incoming/outgoing velocity (px/s -> m/s via homog)
+            spd_in = _px_speed_to_mps(homE, ev.u, ev.v, ev.vx_in, ev.vy_in, fps)
+            spd_out = _px_speed_to_mps(homE, ev.u, ev.v, ev.vx_out, ev.vy_out, fps)
+            spd_chg = (spd_out - spd_in) if (spd_in is not None and spd_out is not None) else None
+            dist_net = (abs(ev.y_m - net_y) if ev.y_m is not None else None)
+            hcw.writerow([
+                f"hit_{hit_seq:06d}", n, _fmt(n / fps), cam_name, "", "",       # rally_id, shot_index: tier-3
+                ev.type, "", "",                                                # weak label; GT shot_label/label_correct empty
+                _fmt(ev.u, 1), _fmt(ev.v, 1), _fmt(ev.x_m), _fmt(ev.y_m),
+                _fmt(court_z), _fmt(dist_net), "" if ev.in_court is None else int(ev.in_court),
+                _fmt(spd_in), _fmt(spd_out), _fmt(spd_chg),
+                _fmt(_turn_deg(ev.vx_in, ev.vy_in, ev.vx_out, ev.vy_out), 1),
+                _fmt(_angle_deg(ev.vx_in, ev.vy_in), 1), _fmt(_angle_deg(ev.vx_out, ev.vy_out), 1),
+                ev.player_hand or "", "", "", "", "",                           # hand; player_* tier-3
+                n_cams, _fmt(confE),
+            ])
 
-        # --- per-frame ball-location log: cam1/cam2 image px + shared court x/y/z (m) ---
+        # --- per-frame ball-location log (detector optimization): per-camera detection +
+        #     heatmap peak / conf / gap, plus the shared court x/y/z and triangulation error ---
         cw.writerow([
-            n,
+            n, _fmt(n / fps), source or "lost", n_cams,
             1 if seenA else 0,
-            f"{uvA[0]:.1f}" if seenA else "", f"{uvA[1]:.1f}" if seenA else "",
+            _fmt(uvA[0], 1) if seenA else "", _fmt(uvA[1], 1) if seenA else "",
+            _fmt(peakA), _fmt(confA), gapA,
             1 if seenB else 0,
-            f"{uvB[0]:.1f}" if seenB else "", f"{uvB[1]:.1f}" if seenB else "",
-            f"{court[0]:.3f}" if court else "", f"{court[1]:.3f}" if court else "",
-            f"{court_z:.3f}" if court_z is not None else "",
-            source or "lost",
+            _fmt(uvB[0], 1) if seenB else "", _fmt(uvB[1], 1) if seenB else "",
+            _fmt(peakB), _fmt(confB), gapB,
+            _fmt(court[0]) if court else "", _fmt(court[1]) if court else "",
+            _fmt(court_z), _fmt(reproj, 1),
         ])
 
         # --- court overlay on the full-res frames, THEN scale to panels ---
@@ -430,4 +583,5 @@ if __name__ == "__main__":
     with open(args.config_b, "r", encoding="utf-8") as f:
         cb = json.load(f)
     run_dual_view(ca, cb, max_frames=args.max_frames,
-                  show=args.show, save_video=args.save_video)
+                  show=args.show, save_video=args.save_video,
+                  cfg_a_path=args.config_a, cfg_b_path=args.config_b)

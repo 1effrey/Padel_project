@@ -478,7 +478,8 @@ def main() -> None:
         config_b = load_config(args.config2)
         run_dual_view(config, config_b, max_frames=args.max_frames,
                       show=args.show, save_video=args.save_video,
-                      yellow_gate=args.yellow_gate)
+                      yellow_gate=args.yellow_gate,
+                      cfg_a_path=args.config, cfg_b_path=args.config2)
         return
 
     if args.sync_manual:

@@ -76,6 +76,12 @@ class BallEvent:
     in_court: Optional[bool] = None # in/out, for floor bounces
     player_hand: Optional[str] = None    # "left"/"right"/"" for a player_hit; else None
     speed_change: Optional[float] = None  # px/s speed change at a hit (>0 = sped up)
+    # incoming (pre-contact) and outgoing (post-contact) velocity in px/s, attached for
+    # downstream feature logging (speeds / angles). Pure data -- no effect on detection.
+    vx_in: Optional[float] = None
+    vy_in: Optional[float] = None
+    vx_out: Optional[float] = None
+    vy_out: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -86,6 +92,8 @@ class BallEvent:
             "in_court": self.in_court,
             "player_hand": self.player_hand,
             "speed_change": None if self.speed_change is None else float(self.speed_change),
+            "vx_in": self.vx_in, "vy_in": self.vy_in,
+            "vx_out": self.vx_out, "vy_out": self.vy_out,
         }
 
 
@@ -280,8 +288,13 @@ class BallEventDetector:
 
         # rule 2: did the trajectory bend right after contact? -> a real hit.
         if self._deflected(self._pc_vel_in, vx, vy, self.player_cos_turn):
+            # floor-project the contact pixel to court metres (approximate for an airborne
+            # contact, but the best single-camera estimate; height comes from triangulation).
+            cx = cy = None
+            if self.h is not None:
+                cx, cy = self.h.pixel_to_meters(self._pc_uv)
             ev = BallEvent(self._pc_frame, "player_hit", self._pc_uv[0], self._pc_uv[1],
-                           None, None, None, player_hand=self._pc_hand)
+                           cx, cy, None, player_hand=self._pc_hand)
             self._player_lock_until = frame + self.player_cooldown   # rule 3: lock the swing
             self._pc_active = False
             return ev
@@ -426,6 +439,13 @@ class BallEventDetector:
 
         if ev is not None:
             self._last_event_frame = frame
+            # attach incoming/outgoing velocity (px/s) for downstream feature logging only.
+            # player_hit's incoming is the stored APPROACH velocity (the event is pinned to
+            # the contact frame); every other event diffs the consecutive measured frames.
+            vin = self._pc_vel_in if ev.type == "player_hit" else prev_vel
+            if vin is not None:
+                ev.vx_in, ev.vy_in = float(vin[0]), float(vin[1])
+            ev.vx_out, ev.vy_out = float(vx), float(vy)
         return ev
 
 

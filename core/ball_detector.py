@@ -271,6 +271,11 @@ class BallDetector:
         # candidates from the LAST detect() (in-ROI blobs, confidence-sorted). The
         # tracker reads these to pick the moving ball over a static distractor.
         self.last_candidates: List[BallDetection] = []
+        # raw heatmap peak (0..1) of the LAST detect(), or None on warmup/stub frames.
+        # This is the hard-example-mining signal: a LOW peak = a frame the model is unsure
+        # about. Captured here (no extra inference) purely for logging -- it does NOT affect
+        # detection. (For a found ball it equals the global max; for a miss it's the residual.)
+        self.last_heatmap_peak: Optional[float] = None
 
     # ------------------------------------------------------------------ public
     def detect(self, frame: np.ndarray) -> BallDetection:
@@ -284,14 +289,17 @@ class BallDetector:
         # stub mode: honest "no ball" everywhere, clearly tagged
         if not self.has_weights:
             self.last_candidates = []
+            self.last_heatmap_peak = None
             return BallDetection(found=False, reason="stub-no-weights")
 
         # not enough frames yet to form the input stack
         if len(self._buffer) < self.in_frames:
             self.last_candidates = []
+            self.last_heatmap_peak = None
             return BallDetection(found=False, reason="warmup")
 
         heatmap = self._infer()                       # (net_h, net_w) in [0, 1]
+        self.last_heatmap_peak = float(heatmap.max())  # logging signal only (no behavior change)
         orig_h, orig_w = frame.shape[:2]
         return self._heatmap_to_detection(heatmap, orig_w, orig_h)
 
