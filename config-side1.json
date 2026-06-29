@@ -315,12 +315,20 @@
       "player_cooldown_frames": 10,
       "player_contact_px": 90,
       "player_pass_frames": 4,
+      "_ekf_note": "the online gravity EKF (continuous track + gap-bounce recovery) is configured under ball.ekf below",
       "net_min_speed_px_s": 600,
       "net_speed_drop": 0.45,
       "net_turn_deg": 40,
       "net_margin_px": 120,
       "refractory_frames": 3,
       "in_out_margin_m": 0.1
+    },
+    "ekf": {
+      "enabled": true,
+      "bounce_z_m": 0.6,
+      "tri_recent_frames": 6,
+      "min_fall_vz_mps": 2.0,
+      "bounce_dedup_frames": 8
     }
   },
   "reid": {

@@ -32,7 +32,8 @@ import numpy as np
 
 from core.ball_eval import _build_detector, _build_events, _build_tracker, _wrists
 from core.camera_calib import build_camera, triangulate_ball
-from utils.homography import COURT_LENGTH_M, Homography, draw_court_lines
+from utils.homography import (COURT_LENGTH_M, Homography, draw_court_lines,
+                              is_inside_court)
 from utils.minimap import Minimap
 from utils.video_io import ThreadedVideoReader
 
@@ -94,6 +95,16 @@ def _ball_uv(track) -> Optional[Tuple[float, float]]:
     if track.x is not None:
         return float(track.x), float(track.y)
     return None
+
+
+def _smooth_uv(track) -> Optional[Tuple[float, float]]:
+    """The SMOOTHED Kalman position (image-plane) for the trail -- smooth and free of the
+    single-camera height ambiguity. None when the track is lost (breaks the trail). It
+    coasts smoothly through short gaps (status 'coasting'), so the line stays continuous
+    without the zigzag that re-projecting the 3D EKF onto one camera produces."""
+    if track is None or track.x is None or track.status == "lost":
+        return None
+    return float(track.x), float(track.y)
 
 
 def _fmt(v, prec: int = 3) -> str:
@@ -253,6 +264,31 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     net_y = COURT_LENGTH_M / 2.0
     bounces = []                                     # accumulated landing-map points (x, y, in)
 
+    # ONLINE PROJECTILE EKF (gravity-aware 3D track in the GLOBAL court frame, == side-1's
+    # frame). It is fed by TRIANGULATED 3D points (both cameras) and side-1 2D detections,
+    # and PREDICTS through gaps with gravity -- so the track stays continuous (no cuts) and a
+    # floor bounce that lands in a 2D-detection gap is still recovered (the EKF carries the
+    # ball down to the floor; the height bottoming out near z=0 IS the bounce). Reuses the
+    # tested filter from core.ball_physics. Causal (no RTS) so it runs live, single pass.
+    from core.ball_physics import ProjectileEKF
+    H_A = np.array(cfg_a["homography"]["H"], dtype=float)
+    ekf = ProjectileEKF(camA, H_A, fps)
+    ekf_on = bool(cfg_a.get("ball", {}).get("ekf", {}).get("enabled", True))
+    _ekf_cfg = cfg_a.get("ball", {}).get("ekf", {})
+    ekf_inited = False
+    ekf_prev_z = None                                # for the z local-minimum bounce test
+    ekf_falling = False                              # was the height decreasing last frame?
+    ekf_tri_age = 10 ** 9                            # frames since the last TRIANGULATED anchor
+    ekf_min_vz = 0.0                                 # most-negative vz during the current fall
+    ekf_bounce_z = float(_ekf_cfg.get("bounce_z_m", 0.6))
+    # GATES that keep EKF bounces trustworthy (single-camera height is noisy in the far half):
+    #   tri_recent_frames -- only fire if 3D height was anchored by triangulation recently;
+    #   min_fall_vz_mps   -- only fire after a GENUINE fall (a real descent, not z-noise).
+    ekf_tri_recent = int(_ekf_cfg.get("tri_recent_frames", 6))
+    ekf_min_fall_vz = float(_ekf_cfg.get("min_fall_vz_mps", 2.0))
+    last_floor_bounce = -10 ** 9                     # dedup floor bounces (EKF + 2D detector)
+    floor_dedup = int(_ekf_cfg.get("bounce_dedup_frames", 8))
+
     # pose -> wrists, needed for PLAYER HITS (a deflection only counts as a player hit at
     # racket reach from a wrist; a net volley benefits too). ONE model instance serves both
     # camera frames. Toggle via cfg_a ball.events.use_pose (default True).
@@ -318,6 +354,20 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     bw.writerow(["event_id", "frame", "t_s", "camera", "rally_id",
                  "court_x_m", "court_y_m", "z_m", "in_court"])
     bounce_seq = 0   # stable event_id counter for bounces
+
+    def _record_bounce(frame: int, cam_name: str, x_m, y_m, in_court) -> bool:
+        """Add a floor bounce to the map + CSV, deduped so the 2D detector and the EKF can
+        BOTH feed bounces without double-counting the same landing. Returns True if added."""
+        nonlocal bounce_seq, last_floor_bounce
+        if x_m is None or frame - last_floor_bounce < floor_dedup:
+            return False
+        last_floor_bounce = frame
+        bounce_seq += 1
+        bounces.append((x_m, y_m, in_court))
+        bw.writerow([f"bounce_{bounce_seq:06d}", frame, _fmt(frame / fps), cam_name, "",
+                     _fmt(x_m), _fmt(y_m), _fmt(0.0),
+                     "" if in_court is None else int(in_court)])
+        return True
     if show:
         cv2.namedWindow("Ball Dual (side-1 | side-2 | court)", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("Ball Dual (side-1 | side-2 | court)", 1700, 600)
@@ -364,12 +414,15 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
         court = source = color = None
         court_z = None
         reproj = None                                      # triangulation residual (px)
+        tri_std = None                                      # triangulation anisotropic 1-sigma (m)
         if seenA and seenB:
             res = triangulate_ball(camA, camB, uvA, uvB, max_reproj)
             if res is not None:
                 court = (float(res["X"][0]), float(res["X"][1]))    # triangulated x, y (in-bounds)
                 court_z = float(res["X"][2])                        # real triangulated height (m)
                 reproj = res.get("reproj_px")
+                std = res.get("std")
+                tri_std = (tuple(float(s) for s in std) if std is not None else (0.3, 0.3, 0.3))
                 source, color, n_both = "both (3D)", (0, 220, 0), n_both + 1
         if court is None and seenA and homA is not None:
             p = homA.pixel_to_meters(uvA)
@@ -379,6 +432,50 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
             p = homB.pixel_to_meters(uvB)
             if -2.0 <= p[0] <= 12.0 and -2.0 <= p[1] <= 22.0:
                 court, source, color, n_b = p, "side-2", (255, 180, 0), n_b + 1
+
+        # --- ONLINE EKF: maintain the gravity-aware 3D track. Init from the first court
+        #     position; then predict (gravity) every frame and correct from a triangulated
+        #     3D point (strong) or the side-1 2D detection (weak height). This is what makes
+        #     the track CONTINUOUS through 2D-detection gaps. ---
+        if ekf_on:
+            if not ekf_inited:
+                if court is not None:
+                    ekf.init(court, (0.0, 0.0))
+                    if court_z is not None:
+                        ekf.s[2] = court_z
+                    ekf_inited = True
+            else:
+                ekf.predict()
+                if court_z is not None and tri_std is not None:      # triangulated 3D anchor
+                    ekf.update_3d((court[0], court[1], court_z), tri_std)
+                    ekf_tri_age = 0
+                else:
+                    ekf_tri_age += 1
+                    if seenA:                                        # side-1 2D correction
+                        ekf.update_2d(uvA[0], uvA[1], confA or 1.0)
+                ekf.constrain_floor()
+
+                # FLOOR BOUNCE from the EKF: the height reaches a local MINIMUM near the floor
+                # (the ball fell and is about to rise). Fires even with NO raw detection on the
+                # bounce frame -- gravity carried the EKF down to it. GATED on a recent
+                # triangulated anchor (reliable height) and a genuine prior fall, so noisy
+                # single-camera height in the far half cannot manufacture phantom bounces.
+                z = float(ekf.s[2])
+                ekf_min_vz = min(ekf_min_vz, float(ekf.s[5]))        # deepest descent this fall
+                if (ekf_prev_z is not None and ekf_falling and z >= ekf_prev_z
+                        and ekf_prev_z < ekf_bounce_z
+                        and ekf_tri_age <= ekf_tri_recent            # height is currently reliable
+                        and ekf_min_vz <= -ekf_min_fall_vz           # a real descent happened
+                        and n - last_floor_bounce >= floor_dedup):
+                    bx, by = float(ekf.s[0]), float(ekf.s[1])
+                    owns = -1.0 <= bx <= 11.0 and -1.0 <= by <= 21.0
+                    if owns and _record_bounce(n, "ekf-3d", bx, by,
+                                               is_inside_court((bx, by), 0.1)):
+                        ekf.anchor_floor(bx, by)
+                        ekf.bounce_flip()
+                        ekf_min_vz = 0.0                             # reset the fall tracker
+                ekf_falling = z < (ekf_prev_z if ekf_prev_z is not None else z + 1.0)
+                ekf_prev_z = z
 
         # wrists per camera (only when that camera has a ball -> skip pose on empty frames)
         wristsA = (_wrists(pose.detect(fA), kp_conf)
@@ -393,14 +490,8 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
             if ev is None or ev.type != "floor_bounce" or ev.x_m is None:
                 continue
             owns = (ev.y_m < net_y) if cam_name == "side-1" else (ev.y_m >= net_y)
-            if owns:
-                bounces.append((ev.x_m, ev.y_m, ev.in_court))
-                bounce_seq += 1
-                bw.writerow([
-                    f"bounce_{bounce_seq:06d}", n, _fmt(n / fps), cam_name, "",   # rally_id: tier-3
-                    _fmt(ev.x_m), _fmt(ev.y_m), _fmt(0.0),                        # z_m ~ 0 at floor
-                    "" if ev.in_court is None else int(ev.in_court),
-                ])
+            if owns:                                     # deduped vs the EKF's bounces
+                _record_bounce(n, cam_name, ev.x_m, ev.y_m, ev.in_court)
 
         # --- PLAYER / NET / WALL / FENCE hits: counted ONCE across both cameras (a hit one
         #     camera sees, the other often sees too). The firing camera's panel shows it. ---
@@ -453,11 +544,13 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
             draw_court_lines(fB, homB, thickness=2)
         pA, pB = fit(fA), fit(fB)
         sA, sB = panel_h / fA.shape[0], panel_h / fB.shape[0]
-        # ball shown as a FADING TRAIL on each panel (newest = bright head dot) instead of
-        # a static crosshair, so the moving ball is easy to follow. Visual only -- the
-        # underlying detection/tracking is unchanged; we only record where it was seen.
-        ball_trailA.append((uvA[0], uvA[1]) if seenA else None)
-        ball_trailB.append((uvB[0], uvB[1]) if seenB else None)
+        # ball shown as a FADING TRAIL on each panel (newest = bright head dot). We draw the
+        # SMOOTHED per-camera Kalman position (image-plane) -- NOT the raw detections (jittery)
+        # and NOT the 3D EKF re-projection (a single camera can't see height, so re-projecting
+        # the 3D state swings sideways and zigzags). The 2D Kalman coasts smoothly through
+        # short gaps, giving a clean line; the 3D EKF stays for bounces + the court map.
+        ball_trailA.append(_smooth_uv(tA))
+        ball_trailB.append(_smooth_uv(tB))
         _draw_ball_trail(pA, ball_trailA, sA)
         _draw_ball_trail(pB, ball_trailB, sB)
         cv2.putText(pA, "SIDE 1", (12, 32), _FONT, 1.0, (255, 255, 255), 2)
