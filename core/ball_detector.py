@@ -165,6 +165,38 @@ def preprocess_frame(frame: np.ndarray, net_w: int, net_h: int) -> np.ndarray:
     return np.transpose(img, (2, 0, 1))           # HWC -> CHW
 
 
+def resolve_crop(crop: Optional[Dict[str, Any]], frame_w: int, frame_h: int
+                 ) -> Optional[Tuple[int, int, int, int]]:
+    """Return the court-crop box (x0, y0, x1, y1) CLAMPED to the frame, or None when
+    cropping is disabled / absent / degenerate. ONE place decides the box so training
+    and inference can never disagree about it (the classic train/infer-skew trap).
+
+    NOTE: the live detector currently does NOT crop (preprocess_frame resizes the full
+    frame); this helper is retained for train_ball.py, and with crop.enabled=False it
+    returns None -> full-frame, which matches preprocess_frame exactly."""
+    if not crop or not crop.get("enabled", False):
+        return None
+    x0 = max(0, int(crop["x_min"]))
+    y0 = max(0, int(crop["y_min"]))
+    x1 = min(int(frame_w), int(crop["x_max"]))
+    y1 = min(int(frame_h), int(crop["y_max"]))
+    if x1 - x0 < 2 or y1 - y0 < 2:                # degenerate box -> ignore it
+        return None
+    return (x0, y0, x1, y1)
+
+
+def label_to_net(u: float, v: float, net_w: int, net_h: int,
+                 orig_w: int, orig_h: int,
+                 crop: Optional[Dict[str, Any]] = None) -> Tuple[float, float]:
+    """Map a FULL-RES label pixel (u, v) into NETWORK pixels, matching preprocess_frame's
+    scale (and crop, when enabled) EXACTLY so the heatmap peak lands on the ball."""
+    box = resolve_crop(crop, orig_w, orig_h)
+    if box is not None:
+        x0, y0, x1, y1 = box
+        return (u - x0) * net_w / (x1 - x0), (v - y0) * net_h / (y1 - y0)
+    return u * net_w / orig_w, v * net_h / orig_h
+
+
 def make_gaussian_heatmap(net_w: int, net_h: int,
                           u_net: Optional[float], v_net: Optional[float],
                           sigma: float = 3.0) -> np.ndarray:
