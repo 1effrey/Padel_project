@@ -95,6 +95,7 @@ class BallTracker:
         gate: float = 0.0,
         min_updates_before_gating: int = 3,
         assoc_radius: float = 600.0,
+        reject_unassociated: bool = False,
     ) -> None:
         self.dt = float(dt)                       # seconds per frame (1/fps)
         self.q = float(process_noise)             # acceleration PSD (px/s^2 scale)
@@ -108,6 +109,11 @@ class BallTracker:
         # position (i.e. consistent with the ball's motion). A soft preference, never
         # a hard reject of the only candidate.
         self.assoc_radius = float(assoc_radius)
+        # OPT-IN hard ghost rejection (Phase-2 graft). When True, an ESTABLISHED track
+        # that sees NO motion-consistent candidate coasts instead of fusing a far one.
+        # OFF by default -> behaviour identical to before (see update_multi for the
+        # post-hit-frame caveat). Enable only after measuring hit recall.
+        self.reject_unassociated = bool(reject_unassociated)
         self._reset()
 
     # ------------------------------------------------------------------ public
@@ -143,24 +149,35 @@ class BallTracker:
             r2 = self.assoc_radius ** 2
             near = [c for c in candidates
                     if (c.u - px) ** 2 + (c.v - py) ** 2 <= r2]
-            chosen = max(near or candidates, key=lambda c: c.confidence)
-
-            z = np.array([chosen.u, chosen.v], dtype=float)
-            R = self._R(chosen.confidence)
-            innov = z - self._H @ self._x                     # measurement residual
-            S = self._H @ self._P @ self._H.T + R
-            d2 = float(innov @ np.linalg.solve(S, innov))     # Mahalanobis^2
-            if (self.gate > 0.0
-                    and self._n_updates >= self.min_updates_before_gating
-                    and d2 > self.gate):
-                gated = True                                  # optional outlier reject
+            # OPT-IN hard ghost rejection (reject_unassociated, default OFF): when the
+            # track is ESTABLISHED and NOTHING is motion-consistent, treat every candidate
+            # as a ghost and COAST rather than fuse a far one. WARNING: a real fast / post-
+            # hit ball also jumps far from a constant-velocity prediction, so this can DROP
+            # the crucial post-hit frame -- measure hit recall before enabling. Default OFF
+            # keeps the original "fall back to ALL candidates" behaviour exactly.
+            if (not near and self.reject_unassociated
+                    and self._n_updates >= self.min_updates_before_gating):
+                pool: List[BallDetection] = []                # all far -> ghosts -> coast
             else:
-                K = self._P @ self._H.T @ np.linalg.inv(S)    # fuse the measurement
-                self._x = self._x + K @ innov
-                self._P = (np.eye(4) - K @ self._H) @ self._P
-                self._coast = 0
-                self._n_updates += 1
-                return self._out("tracking", measured=True, meas=(chosen.u, chosen.v))
+                pool = near or candidates
+            if pool:
+                chosen = max(pool, key=lambda c: c.confidence)
+                z = np.array([chosen.u, chosen.v], dtype=float)
+                R = self._R(chosen.confidence)
+                innov = z - self._H @ self._x                 # measurement residual
+                S = self._H @ self._P @ self._H.T + R
+                d2 = float(innov @ np.linalg.solve(S, innov)) # Mahalanobis^2
+                if (self.gate > 0.0
+                        and self._n_updates >= self.min_updates_before_gating
+                        and d2 > self.gate):
+                    gated = True                              # optional outlier reject
+                else:
+                    K = self._P @ self._H.T @ np.linalg.inv(S)  # fuse the measurement
+                    self._x = self._x + K @ innov
+                    self._P = (np.eye(4) - K @ self._H) @ self._P
+                    self._coast = 0
+                    self._n_updates += 1
+                    return self._out("tracking", measured=True, meas=(chosen.u, chosen.v))
 
         # --- no usable measurement -> coast on the prediction ---
         self._coast += 1

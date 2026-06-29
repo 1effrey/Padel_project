@@ -128,6 +128,7 @@ def _build_tracker(config: Dict[str, Any], fps_in: float):
         gate=t.get("gate", 0.0),
         min_updates_before_gating=t.get("min_updates_before_gating", 3),
         assoc_radius=t.get("assoc_radius_px", 600.0),
+        reject_unassociated=t.get("reject_unassociated", False),
     )
     return tracker, int(t.get("trail_len", 30))
 

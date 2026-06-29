@@ -264,6 +264,27 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
     net_y = COURT_LENGTH_M / 2.0
     bounces = []                                     # accumulated landing-map points (x, y, in)
 
+    # --- Phase-1 graft: OPT-IN image-space near-half ownership (no homography needed) ---
+    # Each end-camera owns its NEAR half, which in its OWN image is the region ABOVE the
+    # net line (smaller image-y, where the near players are large and the ball is clear).
+    # Set "net_line_y" (full-res image pixels) under a camera config's "court" block to
+    # enable; when it is ABSENT the gate is a NO-OP and behaviour is byte-identical to before.
+    # We gate ONLY the half-owned event type -- player_hit (a player lives in one half).
+    # net_hit (at the net boundary, both cameras see it), wall_bounce and fence_hit (court
+    # SIDES, not near/far) are NOT gated -- a horizontal net-line does not apply to them, so
+    # they keep the existing cross-camera dedup untouched.
+    net_line_a = cfg_a.get("court", {}).get("net_line_y")
+    net_line_b = cfg_b.get("court", {}).get("net_line_y")
+
+    def _near_half_owns(cam_name: str, ev) -> bool:
+        """True if the ball is in the OWNING camera's near half by the IMAGE net-line.
+        Returns True (does NOT gate) when net_line_y is unset for that camera, so the
+        feature is fully opt-in and reverts by simply removing the config key."""
+        nl = net_line_a if cam_name == "side-1" else net_line_b
+        if nl is None:
+            return True
+        return ev.v < float(nl)        # near half = above the net line in this camera's image
+
     # ONLINE PROJECTILE EKF (gravity-aware 3D track in the GLOBAL court frame, == side-1's
     # frame). It is fed by TRIANGULATED 3D points (both cameras) and side-1 2D detections,
     # and PREDICTS through gaps with gravity -- so the track stays continuous (no cuts) and a
@@ -497,6 +518,11 @@ def run_dual_view(cfg_a: Dict[str, Any], cfg_b: Dict[str, Any],
         #     camera sees, the other often sees too). The firing camera's panel shows it. ---
         for ev, cam_name, recent in ((eA, "side-1", recentA), (eB, "side-2", recentB)):
             if ev is None or ev.type not in _HIT_TYPES:
+                continue
+            # Phase-1 graft (opt-in via court.net_line_y): a PLAYER hit only counts from the
+            # camera whose NEAR half the contact is in -> rejects the far camera's noisy view
+            # of a hit the near camera should own. No-op when net_line_y is unset.
+            if ev.type == "player_hit" and not _near_half_owns(cam_name, ev):
                 continue
             if n - last_hit_frame[ev.type] < hit_dedup:
                 continue                              # duplicate of the other camera's hit
