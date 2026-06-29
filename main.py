@@ -398,9 +398,10 @@ def main() -> None:
         return
 
     if args.label_ball:
-        from core.ball_label import run_label_ball, read_frame_list
+        from core.ball_label import run_label_ball, read_frame_list, read_proposals
         frames = read_frame_list(args.label_from) if args.label_from else None
-        run_label_ball(config, frames=frames)
+        proposals = read_proposals(args.label_from) if args.label_from else None
+        run_label_ball(config, frames=frames, proposals=proposals)
         return
 
     if args.calibrate_roi:
