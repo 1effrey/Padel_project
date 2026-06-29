@@ -267,7 +267,7 @@
       "out_size": 768,
       "note": "derived from court.polygon bbox + margins (top=400 lob airspace, sides=80, bottom=60), clamped to 3840x2160; force-scaled to out_size x out_size (anamorphic)."
     },
-    "heatmap_threshold": 0.5,
+    "heatmap_threshold": 0.65,
     "min_blob_area": 2,
     "max_blob_area": 400,
     "method": "tracknet",
