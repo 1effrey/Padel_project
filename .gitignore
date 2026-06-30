@@ -21,3 +21,12 @@ output/
 
 # Weight backups & checkpoints
 *.bak
+
+# Large data / binaries committed by mistake (keep local only)
+rclone.zip
+rclone_dir/
+Fadi Ball Tracking/
+results/
+hard_frames_*.csv
+label_batch_*.csv
+run*_hits.csv
