@@ -97,13 +97,19 @@ def _ball_uv(track) -> Optional[Tuple[float, float]]:
     return None
 
 
-def _smooth_uv(track) -> Optional[Tuple[float, float]]:
+def _smooth_uv(track, max_coast_draw: int = 2) -> Optional[Tuple[float, float]]:
     """The SMOOTHED Kalman position (image-plane) for the trail -- smooth and free of the
     single-camera height ambiguity. None when the track is lost (breaks the trail). It
-    coasts smoothly through short gaps (status 'coasting'), so the line stays continuous
-    without the zigzag that re-projecting the 3D EKF onto one camera produces."""
+    coasts smoothly through SHORT gaps (status 'coasting') so the line stays continuous,
+    but BREAKS once the coast exceeds `max_coast_draw` frames -- otherwise, after the ball is
+    truly lost, the Kalman filter keeps PREDICTING along its last velocity and the trail draws
+    a long fake line (e.g. shooting straight up to the fence). A MEASURED frame always draws;
+    only a sustained coast (a guessed position) is suppressed. Pure trail hygiene -- detection,
+    tracking, events and the court placement are untouched."""
     if track is None or track.x is None or track.status == "lost":
         return None
+    if not track.measured and track.coast > max_coast_draw:
+        return None                          # long coast = guessed -> don't draw the drift
     return float(track.x), float(track.y)
 
 
