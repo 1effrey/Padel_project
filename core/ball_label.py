@@ -82,12 +82,49 @@ def read_frame_list(path: str) -> List[int]:
     return sorted(frames)
 
 
-def run_label_ball(config: Dict[str, Any], stride: Optional[int] = None,
-                   start_frame: int = 0, frames: Optional[List[int]] = None) -> None:
+def read_proposals(
+    path: str,
+) -> Dict[int, Tuple[Optional[float], Optional[float], str, str]]:
+    """Read the miner's hard-frames CSV -> {frame: (hint_u, hint_v, reason, conf)}.
+
+    These are the MODEL's own guesses for each hard frame -- a detection's pixel, or
+    (for a MISS) the tracker's predicted position. The labeler shows them so you can
+    ACCEPT a correct guess with one key instead of clicking every frame. Frames with no
+    usable hint return (None, None, ...) and just fall back to manual labeling."""
+    props: Dict[int, Tuple[Optional[float], Optional[float], str, str]] = {}
+    if not os.path.isfile(path):
+        return props
+    with open(path, "r", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                fr = int(row["frame"])
+            except (KeyError, ValueError):
+                continue
+
+            def _num(key: str) -> Optional[float]:
+                val = row.get(key, "")
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    return None
+
+            props[fr] = (_num("hint_u"), _num("hint_v"),
+                         row.get("reason", ""), str(row.get("confidence", "")))
+    return props
+
+
+def run_label_ball(
+    config: Dict[str, Any], stride: Optional[int] = None, start_frame: int = 0,
+    frames: Optional[List[int]] = None,
+    proposals: Optional[Dict[int, Tuple[Optional[float], Optional[float], str, str]]] = None,
+) -> None:
     """Open config["source"] and label the ball -> CSV.
 
     `frames`: if given (e.g. from --label-from / the hard-example miner), step through
-    ONLY those frames instead of striding the whole clip."""
+    ONLY those frames instead of striding the whole clip.
+    `proposals`: optional {frame: (u, v, reason, conf)} of the model's guesses; when a
+    frame has one it is drawn in magenta and ENTER accepts it as the label (one-key
+    confirm). Click still overrides it, B still marks not-visible."""
     source = config["source"]
     out_dir = config.get("output", {}).get("dir", "output")
     os.makedirs(out_dir, exist_ok=True)
@@ -181,16 +218,31 @@ def run_label_ball(config: Dict[str, Any], stride: Optional[int] = None,
         else:
             tag = "unlabeled"
 
+        # draw the MODEL's proposal for this frame (magenta) -> ENTER accepts it.
+        # Only shown when the frame is not already labelled, so a confirmed label wins.
+        prop = proposals.get(idx) if proposals else None
+        has_prop = (prop is not None and prop[0] is not None and prop[1] is not None
+                    and lab is None)
+        if has_prop:
+            pu, pv = int(prop[0] * scale), int(prop[1] * scale)
+            cv2.circle(disp, (pu, pv), 11, (255, 0, 255), 2)
+            cv2.drawMarker(disp, (pu, pv), (255, 0, 255), cv2.MARKER_CROSS, 24, 1)
+            cv2.putText(disp, f"PROPOSAL [{prop[2]}] conf={prop[3]}  ->  ENTER=accept",
+                        (10, 52), font, 0.6, (255, 0, 255), 2)
+
         prog = (f"{state['pos'] + 1}/{len(nav)}  (frame {idx})" if nav
                 else f"frame {idx}/{max(0, total - 1)}")
         cv2.putText(disp, f"{prog}   [{tag}]   labeled={len(labels)}",
                     (10, 28), font, 0.7, (255, 255, 255), 2)
-        cv2.putText(disp, "L-click:ball  B:not-visible  D/Space:skip  A:back  X:clear  S:save  Q:quit",
-                    (10, disp.shape[0] - 14), font, 0.55, (200, 200, 200), 2)
+        cv2.putText(disp, "ENTER:accept guess  L-click:ball  B:not-visible  D/Space:skip  A:back  X:clear  S:save  Q:quit",
+                    (10, disp.shape[0] - 14), font, 0.5, (200, 200, 200), 2)
         cv2.imshow(win, disp)
 
         key = cv2.waitKey(20) & 0xFF
-        if key == ord("b"):
+        if key in (13, 10) and has_prop:               # ENTER -> accept the model's guess
+            labels[idx] = (1, float(prop[0]), float(prop[1]))
+            go(1)
+        elif key == ord("b"):
             labels[idx] = (0, None, None)
             go(1)
         elif key in (ord("d"), ord(" ")):
