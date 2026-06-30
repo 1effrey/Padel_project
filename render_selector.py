@@ -27,7 +27,7 @@ from core.ball_eval import _build_detector
 from core.ball_selector import FixedLagBallSelector
 
 PANEL_H = 540
-TRAIL_LEN = 25
+TRAIL_LEN = 14
 # per-camera selector params (from the eval: side-1 likes a bigger tube, side-2 the default)
 SEL = {
     "side-1": dict(lag=5, max_step_px=450.0, min_support=2, static_radius_px=20.0),
@@ -36,11 +36,28 @@ SEL = {
 
 
 def detect_and_select(cfg, params, max_frames):
-    """Pass 1 for one camera -> {frame_idx: (u,v) or None} clean track."""
+    """Pass 1 for one camera -> {frame_idx: (u,v) or None} clean, SMOOTHED track.
+    detector -> fixed-lag selector (ghost rejection) -> Kalman (smoothing + short coast).
+    Same as the production chain, so this is what the integrated output will look like."""
+    from core.ball_detector import BallDetection
+    from core.ball_eval import _build_tracker
     det = _build_detector(cfg)
     sel = FixedLagBallSelector(**params)
     cap = cv2.VideoCapture(cfg["source"])
+    fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
+    trk, _ = _build_tracker(cfg, fps)
     clean = {}
+
+    def feed(pt):
+        meas = ([BallDetection(found=True, u=pt.u, v=pt.v, confidence=pt.conf, reason="ok")]
+                if pt.source == "detected" else [])
+        t = trk.update_multi(meas)
+        # smoothed Kalman position; trail hygiene: draw only measured or a SHORT coast
+        if t.x is not None and t.status != "lost" and (t.measured or t.coast <= 2):
+            clean[pt.frame] = (float(t.x), float(t.y))
+        else:
+            clean[pt.frame] = None
+
     n = 0
     while True:
         ok, frame = cap.read()
@@ -49,12 +66,12 @@ def detect_and_select(cfg, params, max_frames):
         det.detect(frame)
         pt = sel.push(n, list(getattr(det, "last_candidates", [])))
         if pt is not None:
-            clean[pt.frame] = (pt.u, pt.v) if pt.source == "detected" else None
+            feed(pt)
         n += 1
         if max_frames and n >= max_frames:
             break
     for pt in sel.flush():
-        clean[pt.frame] = (pt.u, pt.v) if pt.source == "detected" else None
+        feed(pt)
     cap.release()
     print(f"  {cfg['source']}: {sum(1 for v in clean.values() if v)} clean ball frames / {len(clean)}")
     return clean
