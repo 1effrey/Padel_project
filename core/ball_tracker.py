@@ -96,6 +96,7 @@ class BallTracker:
         min_updates_before_gating: int = 3,
         assoc_radius: float = 600.0,
         reject_unassociated: bool = False,
+        max_step_px: float = 0.0,
     ) -> None:
         self.dt = float(dt)                       # seconds per frame (1/fps)
         self.q = float(process_noise)             # acceleration PSD (px/s^2 scale)
@@ -114,6 +115,16 @@ class BallTracker:
         # OFF by default -> behaviour identical to before (see update_multi for the
         # post-hit-frame caveat). Enable only after measuring hit recall.
         self.reject_unassociated = bool(reject_unassociated)
+        # OPT-IN jump gate (default OFF, 0 = disabled): reject a chosen candidate that
+        # TELEPORTS from the last MEASURED position by more than max_step_px (scaled up
+        # after coast gaps). A real ball moves CONTINUOUSLY -- even a post-hit ball reverses
+        # direction but stays NEAR where it just was -- so a huge one-frame jump to a far
+        # blob is almost always a false positive (a detection on the fence / a light / a
+        # limb). Gating on the last MEASURED position (not the KF prediction, which can point
+        # the wrong way right after a hit) is what makes this SAFE -- unlike reject_unassociated
+        # it does NOT drop the real post-hit ball. This is the cure for the "ball teleports to
+        # the fence" fake-trajectory artifact.
+        self.max_step_px = float(max_step_px)
         self._reset()
 
     # ------------------------------------------------------------------ public
@@ -160,8 +171,19 @@ class BallTracker:
                 pool: List[BallDetection] = []                # all far -> ghosts -> coast
             else:
                 pool = near or candidates
-            if pool:
-                chosen = max(pool, key=lambda c: c.confidence)
+            chosen = max(pool, key=lambda c: c.confidence) if pool else None
+            # OPT-IN jump gate: reject a chosen candidate that teleports from the last
+            # MEASURED position (budget grows with the coast gap, since the ball can move
+            # further the longer we have not seen it). Continuous ball motion passes; a
+            # one-frame leap to a far false positive (the fence / a light) is rejected -> coast.
+            if (chosen is not None and self.max_step_px > 0.0
+                    and self._last_meas is not None
+                    and self._n_updates >= self.min_updates_before_gating):
+                step = float(np.hypot(chosen.u - self._last_meas[0],
+                                      chosen.v - self._last_meas[1]))
+                if step > self.max_step_px * (1 + self._coast):
+                    chosen = None                             # teleport -> reject, coast
+            if chosen is not None:
                 z = np.array([chosen.u, chosen.v], dtype=float)
                 R = self._R(chosen.confidence)
                 innov = z - self._H @ self._x                 # measurement residual
@@ -177,6 +199,7 @@ class BallTracker:
                     self._P = (np.eye(4) - K @ self._H) @ self._P
                     self._coast = 0
                     self._n_updates += 1
+                    self._last_meas = (float(chosen.u), float(chosen.v))
                     return self._out("tracking", measured=True, meas=(chosen.u, chosen.v))
 
         # --- no usable measurement -> coast on the prediction ---
@@ -224,6 +247,7 @@ class BallTracker:
         self._P: Optional[np.ndarray] = None      # covariance (4,4)
         self._coast = 0
         self._n_updates = 0
+        self._last_meas: Optional[Tuple[float, float]] = None  # last ACCEPTED (u,v), for the jump gate
 
     def _init(self, det: BallDetection) -> None:
         self._x = np.array([det.u, det.v, 0.0, 0.0], dtype=float)
@@ -231,6 +255,7 @@ class BallTracker:
         self._P = np.diag([self.r_base, self.r_base, 1e6, 1e6]).astype(float)
         self._coast = 0
         self._n_updates = 1
+        self._last_meas = (float(det.u), float(det.v))
 
     def _F(self) -> np.ndarray:
         dt = self.dt
