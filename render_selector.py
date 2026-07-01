@@ -31,6 +31,11 @@ PANEL_H = 540
 TRAIL_LEN = 8       # Fadi-style: a SHORT comet (~0.4s). Long trails fold into loops at hits.
 GAP_FILL_MAX = 5    # bridge detector misses up to this many frames (Fadi: 'inpaint')
 SMOOTH_WIN = 7      # local order-2 (parabola) smoothing window -> projectile-shaped arc
+# NEAR-HALF OWNERSHIP (CLAUDE.md decision #2, Fadi's cam*_side): each camera keeps ONLY ball
+# candidates in its near half -- v >= net_line_y - NEAR_MARGIN_PX. This drops the far-background
+# false positives (car headlights) and the opposite player's hand/racket, so the trail can't
+# draw an impossible cross-court "pass-and-smash" line. The OTHER camera owns the far half.
+NEAR_MARGIN_PX = 150   # px ABOVE the net line still counted as near (a ball at the net)
 # per-camera selector params (from the eval: side-1 likes a bigger tube, side-2 the default)
 SEL = {
     "side-1": dict(lag=5, max_step_px=450.0, min_support=2, static_radius_px=20.0),
@@ -50,6 +55,9 @@ def detect_and_select(cfg, params, max_frames):
     fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
     trk, _ = _build_tracker(cfg, fps)
     clean = {}
+    # near-half cutoff for THIS camera (None -> no filter, keep whole frame)
+    net_y = (cfg.get("court", {}) or {}).get("net_line_y")
+    near_cut = (float(net_y) - NEAR_MARGIN_PX) if net_y is not None else None
 
     def feed(pt):
         meas = ([BallDetection(found=True, u=pt.u, v=pt.v, confidence=pt.conf, reason="ok")]
@@ -67,7 +75,10 @@ def detect_and_select(cfg, params, max_frames):
         if not ok:
             break
         det.detect(frame)
-        pt = sel.push(n, list(getattr(det, "last_candidates", [])))
+        cands = list(getattr(det, "last_candidates", []))
+        if near_cut is not None:                       # keep only near-half candidates
+            cands = [c for c in cands if float(c.v) >= near_cut]
+        pt = sel.push(n, cands)
         if pt is not None:
             feed(pt)
         n += 1
@@ -85,7 +96,8 @@ def _cached_track(cfg, params, max_frames, cache_path):
     valid cache. The detector is the slow part; caching it lets us re-tune the TRAIL LOOK
     (dots/length/smoothing) instantly without re-detecting. Cache is invalidated if the
     source or max_frames changes. Delete the cache file (or pass --redetect) to force a rerun."""
-    meta = {"source": cfg["source"], "max_frames": int(max_frames), "params": params}
+    meta = {"source": cfg["source"], "max_frames": int(max_frames), "params": params,
+            "near_margin": NEAR_MARGIN_PX}
     if "--redetect" not in sys.argv and os.path.exists(cache_path):
         try:
             blob = json.load(open(cache_path))
