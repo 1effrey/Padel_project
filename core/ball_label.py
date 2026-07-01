@@ -117,6 +117,7 @@ def run_label_ball(
     config: Dict[str, Any], stride: Optional[int] = None, start_frame: int = 0,
     frames: Optional[List[int]] = None,
     proposals: Optional[Dict[int, Tuple[Optional[float], Optional[float], str, str]]] = None,
+    out_path: Optional[str] = None,
 ) -> None:
     """Open config["source"] and label the ball -> CSV.
 
@@ -124,7 +125,10 @@ def run_label_ball(
     ONLY those frames instead of striding the whole clip.
     `proposals`: optional {frame: (u, v, reason, conf)} of the model's guesses; when a
     frame has one it is drawn in magenta and ENTER accepts it as the label (one-key
-    confirm). Click still overrides it, B still marks not-visible."""
+    confirm). Click still overrides it, B still marks not-visible.
+    `out_path`: write labels here instead of output/ball_labels_<clip>.csv. Use this for a
+    HARD-NEGATIVE review so the verified negatives land in their own file and NEVER touch the
+    clean held-out eval labels (which is how the last FP pass poisoned the eval set)."""
     source = config["source"]
     out_dir = config.get("output", {}).get("dir", "output")
     os.makedirs(out_dir, exist_ok=True)
@@ -138,7 +142,7 @@ def run_label_ball(
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     full_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 
-    csv_path = _csv_path(out_dir, source)
+    csv_path = out_path if out_path else _csv_path(out_dir, source)
     labels = _load_existing(csv_path)
     print(f"[label-ball] {source}: {total} frames, step={step}. "
           f"{len(labels)} labels already in {csv_path} (resuming).")

@@ -266,6 +266,26 @@ def _build_clips(config_paths: List[str], out_dir_default: str) -> List[Dict[str
             print(f"[train] no labels found for {source} at {csv_path} -- skipping. "
                   f"(run: python main.py --config {cp} --label-ball)")
             continue
+
+        # Merge hand-verified hard-negatives from their OWN file (kept separate so the clean
+        # held-out eval labels are never touched). Only negatives (visible=0) are taken, and a
+        # baseline "visible=1" always wins -- we never negate a frame the ground truth calls a
+        # real ball. This is the safeguard the last (poisoned) FP pass lacked.
+        base = os.path.splitext(os.path.basename(str(source)))[0]
+        hn_path = os.path.join(out_dir, f"hardneg_ball_{base}.csv")
+        if os.path.isfile(hn_path):
+            added = conflict = 0
+            for fr, (vis, _u, _v) in _load_existing(hn_path).items():
+                if vis == 1:
+                    continue                          # positives don't belong in a hardneg file
+                if labels.get(fr, (0,))[0] == 1:
+                    conflict += 1                     # baseline says real ball -> keep it
+                    continue
+                labels[fr] = (0, None, None)
+                added += 1
+            print(f"[train] {source}: +{added} hard-negatives from {hn_path} "
+                  f"({conflict} skipped as baseline-visible)")
+
         cap = cv2.VideoCapture(source)
         opened = cap.isOpened()
         orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))

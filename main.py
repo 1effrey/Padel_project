@@ -358,6 +358,10 @@ def main() -> None:
                         help="open the click-to-label ball tool on --source and exit")
     parser.add_argument("--label-from",
                         help="with --label-ball: label only the frames listed in this CSV")
+    parser.add_argument("--label-out",
+                        help="with --label-ball: write labels to THIS path instead of the "
+                             "clean output/ball_labels_<clip>.csv (use for hard-negative "
+                             "review so verified negatives stay out of the eval labels)")
     parser.add_argument("--mine-hard", action="store_true",
                         help="find frames worth labeling (model misses / low conf) and exit")
     parser.add_argument("--precision", action="store_true",
@@ -401,7 +405,7 @@ def main() -> None:
         from core.ball_label import run_label_ball, read_frame_list, read_proposals
         frames = read_frame_list(args.label_from) if args.label_from else None
         proposals = read_proposals(args.label_from) if args.label_from else None
-        run_label_ball(config, frames=frames, proposals=proposals)
+        run_label_ball(config, frames=frames, proposals=proposals, out_path=args.label_out)
         return
 
     if args.calibrate_roi:
