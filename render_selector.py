@@ -29,7 +29,9 @@ from core.ball_trail import smooth_trail
 
 PANEL_H = 540
 TRAIL_LEN = 8       # Fadi-style: a SHORT comet (~0.4s). Long trails fold into loops at hits.
-GAP_FILL_MAX = 5    # bridge detector misses up to this many frames (Fadi: 'inpaint')
+GAP_FILL_MAX = 8    # bridge detector misses up to this many frames (Fadi: 'inpaint').
+                    # 8 @ 20fps = 0.4s: fills short mid-rally blinks; longer lulls stay broken
+                    # (won't invent a ball between points). Inpainted pts are parabola-smoothed.
 SMOOTH_WIN = 7      # local order-2 (parabola) smoothing window -> projectile-shaped arc
 # NEAR-HALF OWNERSHIP (CLAUDE.md decision #2, Fadi's cam*_side): each camera keeps ONLY ball
 # candidates in its near half -- v >= net_line_y - NEAR_MARGIN_PX.
