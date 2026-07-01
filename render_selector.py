@@ -28,7 +28,7 @@ from core.ball_selector import FixedLagBallSelector
 from core.ball_trail import smooth_trail
 
 PANEL_H = 540
-TRAIL_LEN = 16
+TRAIL_LEN = 8       # Fadi-style: a SHORT comet (~0.4s). Long trails fold into loops at hits.
 GAP_FILL_MAX = 5    # bridge detector misses up to this many frames (Fadi: 'inpaint')
 SMOOTH_WIN = 7      # local order-2 (parabola) smoothing window -> projectile-shaped arc
 # per-camera selector params (from the eval: side-1 likes a bigger tube, side-2 the default)
@@ -80,10 +80,34 @@ def detect_and_select(cfg, params, max_frames):
     return clean
 
 
+def _cached_track(cfg, params, max_frames, cache_path):
+    """Return the clean per-frame track, running the (GPU) detector pass ONLY if there is no
+    valid cache. The detector is the slow part; caching it lets us re-tune the TRAIL LOOK
+    (dots/length/smoothing) instantly without re-detecting. Cache is invalidated if the
+    source or max_frames changes. Delete the cache file (or pass --redetect) to force a rerun."""
+    meta = {"source": cfg["source"], "max_frames": int(max_frames), "params": params}
+    if "--redetect" not in sys.argv and os.path.exists(cache_path):
+        try:
+            blob = json.load(open(cache_path))
+            if blob.get("meta") == meta:
+                track = {int(k): (tuple(v) if v else None) for k, v in blob["track"].items()}
+                print(f"  cache hit {cache_path}: {sum(1 for v in track.values() if v)} ball frames")
+                return track
+            print(f"  cache stale ({cache_path}) -> re-detecting")
+        except Exception as e:
+            print(f"  cache unreadable ({e}) -> re-detecting")
+    track = detect_and_select(cfg, params, max_frames)
+    json.dump({"meta": meta, "track": {str(k): v for k, v in track.items()}},
+              open(cache_path, "w"))
+    print(f"  cached -> {cache_path}")
+    return track
+
+
 def draw_trail(panel, trail, scale):
-    """Smooth projectile arc: a fading anti-aliased polyline over the gap-filled, parabola-
-    smoothed points + a per-frame dot (Fadi-style) + a bright head. None entries BREAK the
-    line (a true gap -> the ball really left this half / a long miss, never bridged)."""
+    """Fadi-style light comet: a per-frame DOT at each gap-filled, parabola-smoothed point
+    (NO thick line -> no heavy bars on fast balls, no folded loops at hits) joined by a hair-
+    thin 1px connector for readability, plus a hollow-ring head at the current ball. None
+    entries BREAK the trail (a true gap -> ball left this half / long miss, never bridged)."""
     pts = list(trail)
     prev = None
     n = len(pts)
@@ -93,13 +117,12 @@ def draw_trail(panel, trail, scale):
             continue
         cur = (int(round(p[0] * scale)), int(round(p[1] * scale)))
         if prev is not None:
-            thick = max(1, int(1 + 3 * i / max(1, n - 1)))
-            cv2.line(panel, prev, cur, (0, 255, 255), thick, cv2.LINE_AA)
-        cv2.circle(panel, cur, 2, (0, 200, 255), -1, cv2.LINE_AA)   # per-frame dot
+            cv2.line(panel, prev, cur, (0, 200, 255), 1, cv2.LINE_AA)   # hair-thin connector
+        cv2.circle(panel, cur, 2 if i < n - 1 else 3, (0, 255, 255), -1, cv2.LINE_AA)
         prev = cur
-    if prev is not None:
-        cv2.circle(panel, prev, 7, (0, 255, 255), -1, cv2.LINE_AA)
-        cv2.circle(panel, prev, 7, (255, 255, 255), 1, cv2.LINE_AA)
+    if prev is not None:                                   # hollow-ring target on the ball
+        cv2.circle(panel, prev, 6, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(panel, prev, 1, (255, 255, 255), -1, cv2.LINE_AA)
 
 
 def main(max_frames=0):
@@ -110,9 +133,9 @@ def main(max_frames=0):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "selector_render.mp4")
 
-    print("pass 1: detect + select ...")
-    cleanA = detect_and_select(cfgA, SEL["side-1"], max_frames)
-    cleanB = detect_and_select(cfgB, SEL["side-2"], max_frames)
+    print("pass 1: detect + select (cached) ...")
+    cleanA = _cached_track(cfgA, SEL["side-1"], max_frames, os.path.join(out_dir, "clean_side1.json"))
+    cleanB = _cached_track(cfgB, SEL["side-2"], max_frames, os.path.join(out_dir, "clean_side2.json"))
 
     # gap-fill short misses + parabola-smooth each flight segment -> clean projectile arcs
     smA = {f: (p.u, p.v) for f, p in
@@ -162,4 +185,6 @@ def main(max_frames=0):
 
 
 if __name__ == "__main__":
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 0)
+    # first numeric arg = max_frames (0 = whole video); --redetect forces a fresh detector pass
+    nums = [a for a in sys.argv[1:] if a.isdigit()]
+    main(int(nums[0]) if nums else 0)
