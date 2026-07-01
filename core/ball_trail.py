@@ -74,11 +74,19 @@ def _inpaint(seg: List[int], pts: Dict[int, Tuple[float, float]]
     return out
 
 
+# A parabola is used to smooth a window ONLY when the quadratic term is this many times more
+# significant than noise (partial F-test on the curvature term). Otherwise we smooth with a
+# straight LINE -- so a straight-flying ball is NOT bent into an invented curve. High enough that
+# only genuine arcs (lobs/apex) get curved; a real lob's F is huge so it always passes.
+CURV_F = 6.0
+
+
 def _smooth_segment(seg_pts: Dict[int, TrailPoint], window: int
                     ) -> Dict[int, TrailPoint]:
-    """Local order-2 (parabola) least-squares smoothing of u(t) and v(t) over a centered
-    window. Order 2 == the ball's free-flight model, so this de-jitters WITHOUT flattening a
-    real arc. Falls back to the raw point near the ends where the window doesn't fit."""
+    """Local least-squares smoothing of u(t) and v(t) over a centered window. For each axis we
+    fit a straight LINE and a PARABOLA and keep the parabola only if its curvature is
+    statistically justified (partial F-test) -- so a straight ball stays straight (no invented
+    bow) while a real arc still gets its curve. Falls back to the raw point near the ends."""
     fs = sorted(seg_pts)
     if len(fs) < 5 or window < 5:
         return seg_pts
@@ -93,33 +101,43 @@ def _smooth_segment(seg_pts: Dict[int, TrailPoint], window: int
         if lo < 0 or hi >= len(fs):                    # window doesn't fit -> keep raw
             out[f] = seg_pts[f]
             continue
-        wf = fs[lo:hi + 1]
-        su = _quad_fit_eval([float(x) for x in wf], us[lo:hi + 1], float(f))
-        sv = _quad_fit_eval([float(x) for x in wf], vs[lo:hi + 1], float(f))
+        wf = [float(x) for x in fs[lo:hi + 1]]
+        su = _fit_eval(wf, us[lo:hi + 1], float(f))
+        sv = _fit_eval(wf, vs[lo:hi + 1], float(f))
         out[f] = TrailPoint(su, sv, seg_pts[f].src)
     return out
 
 
-def _quad_fit_eval(xs: List[float], ys: List[float], x0: float) -> float:
-    """Fit y = a*x^2 + b*x + c by least squares (centered for conditioning), return y(x0).
-    Pure-Python normal equations on a 3x3 system -- tiny window, no numpy dependency."""
-    mx = sum(xs) / len(xs)
+def _fit_eval(xs: List[float], ys: List[float], x0: float) -> float:
+    """Smooth y at x0, choosing a LINE unless a PARABOLA is statistically justified.
+    Fit both by least squares (centered for conditioning); keep the parabola only if the
+    partial F-test on its quadratic term exceeds CURV_F -- i.e. there is real curvature, not
+    just noise a parabola can always over-fit. Pure Python, tiny window, no numpy."""
+    n = len(xs)
+    mx = sum(xs) / n
     X = [x - mx for x in xs]
-    # moments
-    s0 = float(len(xs))
-    s1 = sum(X)
-    s2 = sum(x * x for x in X)
+    dx = x0 - mx
+
+    # --- straight-line fit (centered: sum(X)=0 so slope/intercept decouple) ---
+    Sxx = sum(x * x for x in X)
+    b1 = sum(ys) / n                                   # intercept at the window centre
+    a1 = (sum(x * y for x, y in zip(X, ys)) / Sxx) if Sxx > 1e-12 else 0.0
+    y_line = a1 * dx + b1
+    sse1 = sum((y - (a1 * x + b1)) ** 2 for x, y in zip(X, ys))
+
+    if n < 4:                                          # too few points to justify a curve
+        return y_line
+
+    # --- parabola fit y = a x^2 + b x + c ---
+    s1, s2 = sum(X), Sxx
     s3 = sum(x ** 3 for x in X)
     s4 = sum(x ** 4 for x in X)
-    t0 = sum(ys)
-    t1 = sum(x * y for x, y in zip(X, ys))
-    t2 = sum(x * x * y for x, y in zip(X, ys))
-    # solve [[s4 s3 s2],[s3 s2 s1],[s2 s1 s0]] [a b c]^T = [t2 t1 t0]^T
-    A = [[s4, s3, s2, t2], [s3, s2, s1, t1], [s2, s1, s0, t0]]
+    t0, t1, t2 = sum(ys), sum(x * y for x, y in zip(X, ys)), sum(x * x * y for x, y in zip(X, ys))
+    A = [[s4, s3, s2, t2], [s3, s2, s1, t1], [s2, s1, float(n), t0]]
     for col in range(3):                               # Gaussian elimination, partial pivot
         piv = max(range(col, 3), key=lambda r: abs(A[r][col]))
         if abs(A[piv][col]) < 1e-12:
-            return ys[len(ys) // 2]                     # degenerate -> middle sample
+            return y_line                              # degenerate -> trust the line
         A[col], A[piv] = A[piv], A[col]
         for r in range(3):
             if r == col:
@@ -130,8 +148,13 @@ def _quad_fit_eval(xs: List[float], ys: List[float], x0: float) -> float:
     a = A[0][3] / A[0][0]
     b = A[1][3] / A[1][1]
     c = A[2][3] / A[2][2]
-    dx = x0 - mx
-    return a * dx * dx + b * dx + c
+    sse2 = sum((y - (a * x * x + b * x + c)) ** 2 for x, y in zip(X, ys))
+
+    # partial F-test: is the quadratic term worth it, or is the line enough?
+    if sse2 <= 1e-9:                                   # perfect (or near) parabola fit
+        return a * dx * dx + b * dx + c
+    F = (sse1 - sse2) / (sse2 / (n - 3))
+    return (a * dx * dx + b * dx + c) if F > CURV_F else y_line
 
 
 def smooth_trail(track: Dict[int, Optional[Tuple[float, float]]],
@@ -200,5 +223,24 @@ if __name__ == "__main__":
     out = smooth_trail({5: (10.0, 20.0)}, gap_fill_max=5, window=7)
     assert out[5].src == "detected"
     print("test3 PASS: lone point handled")
+
+    # 4) a STRAIGHT (but noisy) ball must NOT be bent into a curve
+    def line(f):
+        return (100.0 + 20.0 * f, 300.0 + 14.0 * f)    # straight diagonal, constant velocity
+    track = {}
+    for f in range(0, 20):
+        u, v = line(f)
+        track[f] = (u + (4 if f % 2 else -4), v - (4 if f % 2 else -4))   # zig-zag noise
+    out = smooth_trail(track, gap_fill_max=5, window=7)
+    # collinearity: the smoothed interior points must lie on the straight line (no bow).
+    # measure max deviation of smoothed pts from the true line direction
+    import math as _m
+    devs = []
+    for f in range(4, 16):
+        tu, tv = line(f)
+        devs.append(_m.hypot(out[f].u - tu, out[f].v - tv))
+    maxdev = max(devs)
+    assert maxdev < 3.0, f"straight ball got bowed: max deviation {maxdev:.1f}px"
+    print(f"test4 PASS: straight ball stays straight (max dev {maxdev:.1f}px, no invented curve)")
 
     print("\nAll ball_trail unit tests passed.")
