@@ -101,7 +101,8 @@ def _cached_track(cfg, params, max_frames, cache_path):
     (dots/length/smoothing) instantly without re-detecting. Cache is invalidated if the
     source or max_frames changes. Delete the cache file (or pass --redetect) to force a rerun."""
     meta = {"source": cfg["source"], "max_frames": int(max_frames), "params": params,
-            "near_half": NEAR_HALF_ENABLED, "near_margin": NEAR_MARGIN_PX}
+            "near_half": NEAR_HALF_ENABLED, "near_margin": NEAR_MARGIN_PX,
+            "heatmap_threshold": cfg.get("ball", {}).get("heatmap_threshold")}
     if "--redetect" not in sys.argv and os.path.exists(cache_path):
         try:
             blob = json.load(open(cache_path))
