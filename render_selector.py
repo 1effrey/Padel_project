@@ -17,6 +17,7 @@ Writes output/selector_render.mp4.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from collections import deque
@@ -122,26 +123,51 @@ def _cached_track(cfg, params, max_frames, cache_path):
     return track
 
 
+REVERSAL_COS = -0.17     # cos(100 deg): connect only if the turn is gentler than this
+STEP_BREAK_PX = 220.0    # don't connect across a jump bigger than this (panel px) -> teleport
+
+
 def draw_trail(panel, trail, scale):
-    """Fadi-style light comet: a per-frame DOT at each gap-filled, parabola-smoothed point
-    (NO thick line -> no heavy bars on fast balls, no folded loops at hits) joined by a hair-
-    thin 1px connector for readability, plus a hollow-ring head at the current ball. None
-    entries BREAK the trail (a true gap -> ball left this half / long miss, never bridged)."""
+    """Fadi-style light comet: a per-frame DOT at each gap-filled, parabola-smoothed point,
+    joined by a hair-thin 1px connector, plus a hollow-ring head at the current ball.
+
+    We DRAW the dots always but only CONNECT two consecutive points when the motion is
+    plausible ball flight: not a sharp direction reversal (a real ball can't reverse without a
+    hit/bounce -> a >100 deg turn is landing/contact jitter, so we break instead of drawing the
+    misleading 'forward-then-back' zigzag) and not a teleport (> STEP_BREAK_PX). None entries
+    also break (a true gap)."""
     pts = list(trail)
-    prev = None
+    prev = None            # previous point (panel px, float)
+    prev_vec = None        # previous step direction, for the reversal test
     n = len(pts)
     for i, p in enumerate(pts):
         if p is None:
-            prev = None
+            prev = prev_vec = None
             continue
-        cur = (int(round(p[0] * scale)), int(round(p[1] * scale)))
+        cur = (p[0] * scale, p[1] * scale)
+        curi = (int(round(cur[0])), int(round(cur[1])))
         if prev is not None:
-            cv2.line(panel, prev, cur, (0, 200, 255), 1, cv2.LINE_AA)   # hair-thin connector
-        cv2.circle(panel, cur, 2 if i < n - 1 else 3, (0, 255, 255), -1, cv2.LINE_AA)
+            vx, vy = cur[0] - prev[0], cur[1] - prev[1]
+            step = math.hypot(vx, vy)
+            if step > STEP_BREAK_PX:                        # teleport -> break, no direction yet
+                prev_vec = None
+            elif prev_vec is None:                         # first step after a break/start:
+                prev_vec = (vx, vy)                        # set a baseline but DON'T draw yet
+            else:                                          # we have a validated direction
+                pv = math.hypot(*prev_vec)
+                cosang = (prev_vec[0] * vx + prev_vec[1] * vy) / (pv * step) if pv * step > 1e-6 else 1.0
+                if cosang < REVERSAL_COS:                  # sharp reversal = hit/bounce/jitter
+                    prev_vec = None                        # break: no line, re-baseline next step
+                else:
+                    cv2.line(panel, (int(round(prev[0])), int(round(prev[1]))), curi,
+                             (0, 200, 255), 1, cv2.LINE_AA)
+                    prev_vec = (vx, vy)
+        cv2.circle(panel, curi, 2 if i < n - 1 else 3, (0, 255, 255), -1, cv2.LINE_AA)
         prev = cur
     if prev is not None:                                   # hollow-ring target on the ball
-        cv2.circle(panel, prev, 6, (0, 255, 255), 2, cv2.LINE_AA)
-        cv2.circle(panel, prev, 1, (255, 255, 255), -1, cv2.LINE_AA)
+        pi = (int(round(prev[0])), int(round(prev[1])))
+        cv2.circle(panel, pi, 6, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(panel, pi, 1, (255, 255, 255), -1, cv2.LINE_AA)
 
 
 def main(max_frames=0):
