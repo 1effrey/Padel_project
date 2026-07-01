@@ -263,7 +263,7 @@
       "out_size": 768,
       "note": "y_min aligned to config-side1 (224) so it MATCHES the pooled training crop (the trainer applies the first config's crop to both cameras). Original polygon-derived y_min was 260; the extra 36px just gives a touch more lob airspace."
     },
-    "heatmap_threshold": 0.60,
+    "heatmap_threshold": 0.65,
     "min_blob_area": 2,
     "max_blob_area": 400,
     "method": "tracknet",
